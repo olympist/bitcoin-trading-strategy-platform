@@ -1,0 +1,2287 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import os
+import json
+import time
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import uuid
+import threading
+import queue
+import copy
+
+# Import project modules
+from backtesting.backtester import Backtester
+from utils.data_fetcher import DataFetcher
+from utils.results_manager import ResultsManager
+from strategy.optimized_alternative_dca_v5 import OptimizedAlternativeDCAv5
+
+# Initialize components
+results_manager = ResultsManager()
+data_fetcher = DataFetcher()
+
+# Configure page
+st.set_page_config(
+    page_title="Automated Optimization",
+    page_icon="🤖",
+    layout="wide"
+)
+
+# Session state for background tasks
+if 'optimization_tasks' not in st.session_state:
+    st.session_state.optimization_tasks = []
+
+if 'completed_tasks' not in st.session_state:
+    st.session_state.completed_tasks = []
+
+if 'task_queue' not in st.session_state:
+    st.session_state.task_queue = queue.Queue()
+
+if 'worker_running' not in st.session_state:
+    st.session_state.worker_running = False
+
+if 'current_task' not in st.session_state:
+    st.session_state.current_task = None
+
+if 'optimization_progress' not in st.session_state:
+    st.session_state.optimization_progress = {}
+    
+if 'custom_batches' not in st.session_state:
+    st.session_state.custom_batches = []
+
+# Default parameter ranges for different search methods
+DEFAULT_WIDE_RANGES = {
+    'investment_pct': [5.0, 10.0, 15.0, 20.0, 30.0, 40.0],
+    'price_drop_threshold': [0.5, 1.0, 2.0, 3.0, 5.0],
+    'profit_threshold': [1.0, 2.0, 3.0, 5.0, 8.0],
+    'stop_loss_fixed_pct': [10.0, 15.0, 20.0, 25.0],
+    'trailing_stop_pct': [0.5, 1.0, 1.5, 2.0, 3.0],
+    'max_position_duration': [30, 60, 90, 180, 360],
+    'number_of_bots': [1, 2, 3, 5],
+    'trading_fee_pct': [0.1, 0.15, 0.2],
+    'min_trade_size': [25.0, 50.0, 75.0, 100.0],
+    'partial_profit_taking': [False, True],
+    'profit_taking_percentage': [25.0, 50.0, 75.0],
+    'use_trailing_stop_main': [False, True],
+    'trailing_stop_activation_pct': [0.5, 1.0, 1.5, 2.0, 3.0]
+}
+
+DEFAULT_FOCUSED_RANGES = {
+    'investment_pct': [8.0, 10.0, 12.0, 15.0, 18.0],
+    'price_drop_threshold': [1.5, 2.0, 2.5, 3.0],
+    'profit_threshold': [2.0, 2.5, 3.0, 3.5, 4.0],
+    'stop_loss_fixed_pct': [12.0, 15.0, 18.0],
+    'trailing_stop_pct': [1.2, 1.5, 1.8, 2.0],
+    'max_position_duration': [90, 120, 150, 180, 210],
+    'number_of_bots': [1, 2, 3],
+    'trading_fee_pct': [0.1, 0.15],
+    'min_trade_size': [40.0, 50.0, 60.0],
+    'partial_profit_taking': [False, True],
+    'profit_taking_percentage': [40.0, 50.0, 60.0],
+    'use_trailing_stop_main': [False, True],
+    'trailing_stop_activation_pct': [1.0, 1.5, 2.0]
+}
+
+DEFAULT_PRECISE_RANGES = {
+    'investment_pct': [9.0, 10.0, 11.0, 12.0],
+    'price_drop_threshold': [1.8, 2.0, 2.2, 2.4],
+    'profit_threshold': [2.8, 3.0, 3.2, 3.4],
+    'stop_loss_fixed_pct': [14.0, 15.0, 16.0],
+    'trailing_stop_pct': [1.4, 1.5, 1.6],
+    'max_position_duration': [165, 180, 195],
+    'number_of_bots': [2, 3],
+    'trading_fee_pct': [0.1],
+    'min_trade_size': [45.0, 50.0, 55.0],
+    'partial_profit_taking': [False, True],
+    'profit_taking_percentage': [45.0, 50.0, 55.0],
+    'use_trailing_stop_main': [True],
+    'trailing_stop_activation_pct': [1.4, 1.5, 1.6]
+}
+
+# Default fixed parameters (will be used for parameters not included in optimization)
+DEFAULT_FIXED_PARAMS = {
+    'trading_fee_pct': 0.1,
+    'min_trade_size': 50.0,
+    'partial_profit_taking': False,
+    'profit_taking_percentage': 50.0,
+    'use_trailing_stop_main': True,
+    'trailing_stop_activation_pct': 1.5
+}
+
+# Market condition presets
+MARKET_CONDITION_PRESETS = {
+    'bull_market': {'start_date': '2023-10-01', 'end_date': '2024-02-01'},
+    'bear_market': {'start_date': '2022-04-01', 'end_date': '2022-09-01'},
+    'sideways_market': {'start_date': '2023-02-01', 'end_date': '2023-06-01'},
+    'volatile_market': {'start_date': '2021-04-01', 'end_date': '2021-07-01'},
+    'recent_market': {'start_date': '2024-01-01', 'end_date': '2024-03-01'}
+}
+
+def create_parameter_grid(param_ranges, fixed_params, max_combinations=1000):
+    """
+    Create a grid of parameter combinations for optimization.
+    
+    Args:
+        param_ranges: Dictionary of parameter names to lists of values
+        fixed_params: Dictionary of fixed parameters
+        max_combinations: Maximum number of combinations to generate
+        
+    Returns:
+        List of parameter dictionaries
+    """
+    # Calculate number of combinations
+    total_combinations = 1
+    for values in param_ranges.values():
+        total_combinations *= len(values)
+    
+    if total_combinations <= max_combinations:
+        # Generate all combinations
+        params_list = []
+        param_names = list(param_ranges.keys())
+        param_values = list(param_ranges.values())
+        
+        # Helper function for recursive combination generation
+        def generate_combinations(current_params, index):
+            if index == len(param_names):
+                params_list.append(current_params.copy())
+                return
+            
+            for value in param_values[index]:
+                current_params[param_names[index]] = value
+                generate_combinations(current_params, index + 1)
+        
+        # Start combination generation
+        generate_combinations(fixed_params.copy(), 0)
+        
+        return params_list
+    else:
+        # Random sampling for large parameter spaces
+        params_list = []
+        for _ in range(max_combinations):
+            params = fixed_params.copy()
+            for param, values in param_ranges.items():
+                params[param] = np.random.choice(values)
+            params_list.append(params)
+        
+        return params_list
+
+def create_hierarchical_batches(initial_params=None):
+    """
+    Create a hierarchical optimization strategy with multiple batches.
+    
+    Args:
+        initial_params: Optional dictionary with initial parameter estimates
+        
+    Returns:
+        List of batch dictionaries
+    """
+    batches = []
+    
+    # Stage 1: Wide exploration
+    batches.append({
+        'name': "Stage 1: Wide Exploration",
+        'description': "Testing wide parameter ranges to identify promising regions",
+        'optimize': DEFAULT_WIDE_RANGES,
+        'fixed': DEFAULT_FIXED_PARAMS.copy(),
+        'max_combinations': 200
+    })
+    
+    # Stage 2: Focused exploration (will be updated after Stage 1)
+    batches.append({
+        'name': "Stage 2: Focused Exploration",
+        'description': "Testing narrower ranges around promising values",
+        'optimize': DEFAULT_FOCUSED_RANGES,
+        'fixed': DEFAULT_FIXED_PARAMS.copy(),
+        'max_combinations': 150
+    })
+    
+    # Stage 3: Precise tuning (will be updated after Stage 2)
+    batches.append({
+        'name': "Stage 3: Precise Tuning",
+        'description': "Fine-tuning the most promising parameter combinations",
+        'optimize': DEFAULT_PRECISE_RANGES,
+        'fixed': DEFAULT_FIXED_PARAMS.copy(),
+        'max_combinations': 100
+    })
+    
+    # If initial parameters provided, use them to refine ranges
+    if initial_params:
+        # Update focused exploration based on initial params
+        focused_ranges = {}
+        for param, value in initial_params.items():
+            if param in DEFAULT_FOCUSED_RANGES:
+                # Create a range around the initial value
+                if isinstance(value, int):
+                    step = max(1, value // 10)
+                    focused_ranges[param] = [value - 2*step, value - step, value, value + step, value + 2*step]
+                elif isinstance(value, float):
+                    step = value * 0.1
+                    focused_ranges[param] = [value - 2*step, value - step, value, value + step, value + 2*step]
+                else:
+                    focused_ranges[param] = DEFAULT_FOCUSED_RANGES[param]
+        
+        # Update the batch if we have focused ranges
+        if focused_ranges:
+            batches[1]['optimize'] = focused_ranges
+    
+    return batches
+
+def create_market_condition_batches(best_params):
+    """
+    Create batches to test parameters across different market conditions.
+    
+    Args:
+        best_params: Dictionary with best parameters to test
+        
+    Returns:
+        List of batch dictionaries
+    """
+    batches = []
+    
+    # Create a batch for each market condition
+    for condition, dates in MARKET_CONDITION_PRESETS.items():
+        # Create small variations around best parameters
+        optimize = {}
+        for param, value in best_params.items():
+            if param in DEFAULT_FOCUSED_RANGES:
+                if isinstance(value, int):
+                    optimize[param] = [value, value + 1, value - 1]
+                elif isinstance(value, float):
+                    optimize[param] = [value, value * 1.1, value * 0.9]
+                else:
+                    optimize[param] = [value]
+        
+        # Create batch
+        batches.append({
+            'name': f"Market Condition: {condition.replace('_', ' ').title()}",
+            'description': f"Testing parameters in {condition.replace('_', ' ')} conditions ({dates['start_date']} to {dates['end_date']})",
+            'optimize': optimize,
+            'fixed': {k: v for k, v in best_params.items() if k not in optimize},
+            'max_combinations': 50,
+            'date_range': dates
+        })
+    
+    return batches
+
+def run_optimization_batch(batch, price_data, initial_capital=1000.0, progress_callback=None):
+    """
+    Run a single optimization batch.
+    
+    Args:
+        batch: Batch dictionary with parameters
+        price_data: DataFrame with price data
+        initial_capital: Starting capital
+        progress_callback: Optional callback function to report progress
+        
+    Returns:
+        List of optimization results
+    """
+    # Print debug information
+    print(f"Starting optimization batch: {batch.get('name', 'Unnamed')}")
+    print(f"Data shape: {price_data.shape if hasattr(price_data, 'shape') else 'Unknown'}")
+    print(f"Initial capital: {initial_capital}")
+    
+    # Create parameter combinations
+    param_grid = create_parameter_grid(
+        batch['optimize'],
+        batch['fixed'],
+        batch.get('max_combinations', 100)
+    )
+    
+    print(f"Created parameter grid with {len(param_grid)} combinations")
+    
+    # Initialize backtester
+    backtester = Backtester()
+    backtester.set_data(price_data)
+    
+    # Run backtest for each parameter combination
+    results = []
+    total_params = len(param_grid)
+    
+    # Report initial progress
+    if progress_callback:
+        progress_callback(0.0)
+    
+    for i, params in enumerate(param_grid):
+        try:
+            # Report progress (using float for more accuracy)
+            current_progress = float(i) / float(total_params) if total_params > 0 else 0.0
+            if progress_callback:
+                progress_callback(current_progress)
+            
+            # Store current parameter combination in task for display purposes
+            # Find the task that matches the current execution
+            task_id = None
+            for task in st.session_state.optimization_tasks:
+                if 'current_batch' in st.session_state.optimization_progress.get(task['id'], {}):
+                    if st.session_state.optimization_progress[task['id']]['current_batch'] == batch.get('batch_index', 0):
+                        task_id = task['id']
+                        task['current_params'] = params
+                        # Add a descriptive message about the parameters
+                        key_params = {k: params[k] for k in ['investment_pct', 'price_drop_threshold', 'profit_threshold'] 
+                                     if k in params}
+                        param_str = ", ".join([f"{k}={v}" for k, v in key_params.items()])
+                        st.session_state.optimization_progress[task_id]['message'] = f"Testing combination {i+1}/{total_params}: {param_str}"
+                        break
+                
+            # Log progress every 10 combinations
+            if i % 10 == 0 or i == total_params - 1:
+                print(f"Processing combination {i+1}/{total_params} ({current_progress*100:.1f}%)")
+            
+            # Use the correct format for strategy type as expected by the backtester
+            # Add debugging to see what's happening 
+            print(f"Running backtest with strategy 'Optimized Alternative DCA v5' and {len(params)} parameters")
+            print(f"Parameter keys: {list(params.keys())}")
+            
+            try:
+                backtest_results = backtester.run_backtest("Optimized Alternative DCA v5", params)
+            except Exception as e:
+                import traceback
+                print(f"Backtester error: {str(e)}")
+                print(traceback.format_exc())
+                # Return a default result dictionary with negative results
+                backtest_results = {
+                    'return_pct': -100.0,
+                    'max_drawdown_pct': 100.0,
+                    'sharpe_ratio': -10.0,
+                    'win_rate': 0.0,
+                    'trades': []
+                }
+            
+            # Create result dictionary
+            result = {
+                'parameters': params,
+                'metrics': {
+                    'return_pct': backtest_results.get('return_pct', 0),
+                    'max_drawdown_pct': backtest_results.get('max_drawdown_pct', 0),
+                    'win_rate': backtest_results.get('win_rate', 0),
+                    'profit_factor': backtest_results.get('profit_factor', 0),
+                    'sharpe_ratio': backtest_results.get('sharpe_ratio', 0),
+                    'trades_count': len(backtest_results.get('trades', []))
+                },
+                'full_results': backtest_results
+            }
+            
+            results.append(result)
+            
+            # Report partial progress between steps
+            if progress_callback and i < total_params - 1:
+                progress_callback((i + 0.5) / total_params)
+            
+        except Exception as e:
+            print(f"Error in parameter combination {i+1}/{total_params}: {str(e)}")
+    
+    # Final progress update
+    if progress_callback:
+        progress_callback(1.0)
+        
+    print(f"Completed batch with {len(results)} successful results")
+    
+    return results
+
+def load_price_data(data_source, date_range=None):
+    """
+    Load price data from selected source.
+    
+    Args:
+        data_source: Source specification (file path or date range)
+        date_range: Optional dictionary with start_date and end_date
+        
+    Returns:
+        DataFrame with price data
+    """
+    if isinstance(data_source, str) and os.path.exists(data_source):
+        # Load from file
+        df = data_fetcher.load_data(data_source)
+        
+        # Filter by date range if provided
+        if date_range and df is not None:
+            start_date = pd.to_datetime(date_range['start_date'])
+            end_date = pd.to_datetime(date_range['end_date'])
+            df = df[(df.index >= start_date) & (df.index <= end_date)]
+        
+        return df
+    else:
+        # Fetch new data
+        start_date = datetime.now() - timedelta(days=365)
+        end_date = datetime.now()
+        
+        if date_range:
+            start_date = pd.to_datetime(date_range['start_date'])
+            end_date = pd.to_datetime(date_range['end_date'])
+        
+        # Fetch data from exchange
+        df = data_fetcher.fetch_historical_data(
+            exchange_id="binance",
+            symbol="BTC/USDT",
+            timeframe="1h",
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        return df
+
+def check_for_pending_optimizations():
+    """
+    Check for pending optimization tasks in the session state.
+    This function replaces the previous background worker approach with a synchronous method.
+    
+    Returns:
+        bool: True if there are pending tasks, False otherwise
+    """
+    # Get running tasks
+    running_tasks = [task for task in st.session_state.optimization_tasks 
+                     if task.get('status') == 'pending']
+    
+    if running_tasks:
+        return True
+    else:
+        return False
+
+def start_optimization_task(batches, price_data, initial_capital=1000.0, auto_adjust=True):
+    """
+    Start a new optimization task.
+    
+    Args:
+        batches: List of batch dictionaries
+        price_data: DataFrame with price data
+        initial_capital: Starting capital
+        auto_adjust: Whether to automatically adjust parameter ranges between batches
+        
+    Returns:
+        Task ID
+    """
+    # Debug print
+    print("\n=== Starting New Optimization Task ===")
+    print(f"Batches to process: {len(batches)}")
+    if price_data is not None:
+        print(f"Price data shape: {price_data.shape}")
+    else:
+        print("WARNING: Price data is None!")
+    
+    # Create task
+    task_id = str(uuid.uuid4())
+    
+    # Store data in Streamlit session state directly
+    # This is a key change - we'll store price_data as a separate session state variable
+    st.session_state[f"price_data_{task_id}"] = price_data
+    
+    # Extract data information for detailed reporting
+    data_info = {}
+    if price_data is not None and not price_data.empty:
+        try:
+            # Extract date range
+            data_info['start_date'] = price_data.index[0].strftime('%Y-%m-%d')
+            data_info['end_date'] = price_data.index[-1].strftime('%Y-%m-%d')
+            
+            # Calculate number of days
+            days = (price_data.index[-1] - price_data.index[0]).days
+            data_info['days'] = days
+            
+            # Determine timeframe by analyzing intervals
+            if len(price_data) > 1:
+                interval = (price_data.index[1] - price_data.index[0]).total_seconds()
+                if interval <= 60:
+                    data_info['timeframe'] = '1m'
+                elif interval <= 300:
+                    data_info['timeframe'] = '5m'
+                elif interval <= 900:
+                    data_info['timeframe'] = '15m'
+                elif interval <= 3600:
+                    data_info['timeframe'] = '1h'
+                elif interval <= 14400:
+                    data_info['timeframe'] = '4h'
+                elif interval <= 86400:
+                    data_info['timeframe'] = '1d'
+                else:
+                    data_info['timeframe'] = 'Custom'
+            
+            # Get symbol from filename if available
+            filename = getattr(price_data, '_filename', '')
+            if isinstance(filename, str):
+                # Extract symbol from filename patterns like "exchange_YYYY-MM-DD_SYM-QUOTE_timeframe.csv"
+                parts = filename.split('_')
+                if len(parts) >= 3:
+                    symbol_part = parts[2] if len(parts) > 2 else ''
+                    if '-' in symbol_part:
+                        data_info['symbol'] = symbol_part.replace('-', '/') 
+                    else:
+                        data_info['symbol'] = 'BTC/USDT'  # Default
+                else:
+                    data_info['symbol'] = 'BTC/USDT'  # Default
+            else:
+                data_info['symbol'] = 'BTC/USDT'  # Default
+                
+            # Determine exchange (using filename as hint)
+            if isinstance(filename, str):
+                if 'binance' in filename.lower():
+                    data_info['exchange'] = 'Binance'
+                elif 'bitstamp' in filename.lower():
+                    data_info['exchange'] = 'Bitstamp'
+                elif 'coinbase' in filename.lower():
+                    data_info['exchange'] = 'Coinbase'
+                elif 'kraken' in filename.lower():
+                    data_info['exchange'] = 'Kraken'
+                else:
+                    data_info['exchange'] = 'Unknown'
+            else:
+                data_info['exchange'] = 'Unknown'
+        except Exception as e:
+            print(f"Error extracting data info: {str(e)}")
+            data_info = {'error': str(e)}
+    
+    # Create a task record
+    task = {
+        'id': task_id,
+        'name': f"Optimization {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        'batches': batches,
+        'initial_capital': initial_capital,
+        'auto_adjust': auto_adjust,
+        'start_time': datetime.now(),
+        'status': 'pending',
+        'current_batch': 0,
+        'results': [],
+        'data_info': data_info,  # Store data information for better reporting
+        'current_params': {}  # Store current testing parameters
+        # No need to store price_data in task dictionary anymore
+    }
+    
+    # Debug print task details
+    print(f"Created task ID: {task_id[:8]}")
+    print(f"First batch name: {batches[0]['name']}")
+    print(f"Initial capital: ${initial_capital:.2f}")
+    
+    # Add task to session state
+    st.session_state.optimization_tasks.append(task)
+    print(f"Added task to session state, new task count: {len(st.session_state.optimization_tasks)}")
+    
+    # Initialize progress tracking with timing information
+    if task_id not in st.session_state.optimization_progress:
+        st.session_state.optimization_progress[task_id] = {
+            'current_batch': 0,
+            'batch_progress': 0.0,
+            'overall_progress': 0.0,
+            'status': 'pending',
+            'message': 'Task initialized',
+            'start_time': datetime.now(),
+            'estimated_end_time': None,
+            'elapsed_time': 0,
+            'remaining_time': None,
+            'last_update_time': datetime.now(),
+            'batch_times': []  # Will store completion time for each batch
+        }
+    
+    # Set current task
+    st.session_state.current_task = task
+    
+    # Display confirmation
+    st.success(f"Started optimization (Task ID: {task_id[:8]})")
+    
+    # Set status to running
+    st.session_state.optimization_progress[task_id]['status'] = 'running'
+    print(f"Set task status to 'running'")
+    
+    # Set a flag to indicate this task should be executed in the next refresh
+    st.session_state.execute_next_task = task_id
+    
+    print("Task creation complete, returning task_id")
+    print("=== End of Task Creation ===\n")
+    
+    # Ensure we force a re-run to update the UI with the new task
+    st.rerun()
+    
+    return task_id
+
+def execute_batch(task_id, price_data):
+    """
+    Execute a batch of the optimization task.
+    This is a synchronous implementation that runs in the main thread.
+    
+    Args:
+        task_id: ID of the task to execute
+        price_data: DataFrame with price data
+    """
+    # Find the task
+    task = None
+    for t in st.session_state.optimization_tasks:
+        if t['id'] == task_id:
+            task = t
+            break
+    
+    if not task:
+        st.error(f"Task {task_id} not found")
+        return
+    
+    # Get current batch index
+    current_batch = st.session_state.optimization_progress[task_id]['current_batch']
+    
+    # Check if all batches are complete
+    if current_batch >= len(task['batches']):
+        st.session_state.optimization_progress[task_id]['status'] = 'completed'
+        st.session_state.optimization_progress[task_id]['message'] = 'All batches completed'
+        
+        # Process the batch results to find the best result for each batch
+        for i, batch_result in enumerate(task['results']):
+            if 'results' in batch_result and batch_result['results']:
+                # Find the best result based on return
+                best_result = max(batch_result['results'], key=lambda x: x['metrics'].get('return_pct', 0))
+                batch_result['best_result'] = best_result
+        
+        # Add the results to the progress data
+        st.session_state.optimization_progress[task_id]['results'] = task['results']
+        
+        # Move task to completed tasks
+        st.session_state.completed_tasks.append(task)
+        st.session_state.optimization_tasks = [t for t in st.session_state.optimization_tasks if t['id'] != task_id]
+        
+        print(f"Task {task_id[:8]} completed with {len(task['results'])} batch results")
+        return
+    
+    # Get the current batch
+    batch = task['batches'][current_batch]
+    
+    # Update progress
+    st.session_state.optimization_progress[task_id]['status'] = 'running'
+    st.session_state.optimization_progress[task_id]['message'] = f"Running batch: {batch['name']}"
+    
+    # Create a progress callback that updates timing information
+    def progress_callback(progress):
+        # Update current progress
+        st.session_state.optimization_progress[task_id]['batch_progress'] = progress
+        
+        # Calculate overall progress - fix to ensure it's accurate
+        total_batches = len(task['batches'])
+        
+        # Calculate overall progress as a fraction of total
+        if current_batch >= total_batches:
+            overall_progress = 1.0
+        else:
+            # Each batch represents 1/total_batches of the overall progress
+            # Completed batches contribute fully, current batch contributes partially
+            overall_progress = (current_batch + progress) / total_batches
+            
+        # Make sure progress doesn't exceed 100%
+        overall_progress = min(1.0, max(0.0, overall_progress))
+        
+        st.session_state.optimization_progress[task_id]['overall_progress'] = overall_progress
+        
+        # Update timing information
+        now = datetime.now()
+        start_time = st.session_state.optimization_progress[task_id].get('start_time', now)
+        elapsed = (now - start_time).total_seconds()
+        st.session_state.optimization_progress[task_id]['elapsed_time'] = elapsed
+        
+        # Calculate estimated time remaining if we have progress and elapsed time
+        if overall_progress > 0.01 and elapsed > 5:  # Only calculate after meaningful progress
+            # Calculate the rate at which we're processing (time per percentage of progress)
+            time_per_progress_unit = elapsed / overall_progress
+            
+            # Calculate how much time will be needed in total
+            estimated_total_time = time_per_progress_unit
+            
+            # Calculate remaining time (always at least 10 seconds to avoid showing "0" until truly complete)
+            if overall_progress >= 0.99:
+                # Final stage, almost done
+                remaining_time = min(60, max(10, (1.0 - overall_progress) * estimated_total_time))
+            else:
+                # Still has substantial work to do
+                remaining_time = max(10, (1.0 - overall_progress) * estimated_total_time)
+                
+            # Store the remaining time
+            st.session_state.optimization_progress[task_id]['remaining_time'] = remaining_time
+            
+            # Calculate estimated end time
+            estimated_end_time = now + timedelta(seconds=remaining_time)
+            st.session_state.optimization_progress[task_id]['estimated_end_time'] = estimated_end_time
+                
+            # Save the current parameters being tested if available
+            if 'current_params' in task:
+                st.session_state.optimization_progress[task_id]['current_params'] = task['current_params']
+    
+    try:
+        # Run the batch
+        batch_results = run_optimization_batch(
+            batch, 
+            price_data, 
+            task['initial_capital'], 
+            progress_callback
+        )
+        
+        # Store results
+        task['results'].append({
+            'batch': batch,
+            'results': batch_results
+        })
+        
+        # Update task state
+        st.session_state.current_task = task
+        
+        # Move to next batch
+        st.session_state.optimization_progress[task_id]['current_batch'] += 1
+        st.session_state.optimization_progress[task_id]['batch_progress'] = 0.0
+        
+        # If auto-adjust is enabled, update next batch parameters based on results
+        if task['auto_adjust'] and current_batch < len(task['batches']) - 1:
+            # Find top performing parameters
+            if batch_results:
+                # Sort by return (higher is better)
+                sorted_results = sorted(batch_results, key=lambda x: x['metrics']['return_pct'], reverse=True)
+                best_params = sorted_results[0]['parameters']
+                
+                # Update next batch with focused ranges around best parameters
+                next_batch = task['batches'][current_batch + 1]
+                focused_ranges = {}
+                
+                for param, value in best_params.items():
+                    if param in next_batch['optimize']:
+                        # Create a range around the best value
+                        if isinstance(value, int):
+                            step = max(1, value // 10)
+                            focused_ranges[param] = [value - 2*step, value - step, value, value + step, value + 2*step]
+                        elif isinstance(value, float):
+                            step = value * 0.1
+                            focused_ranges[param] = [value - 2*step, value - step, value, value + step, value + 2*step]
+                
+                # Update the batch
+                if focused_ranges:
+                    next_batch['optimize'] = focused_ranges
+                    task['batches'][current_batch + 1] = next_batch
+        
+        # Increment batch counter but don't automatically continue to next batch
+        # The next batch will be processed in the next Streamlit UI refresh cycle
+        # This allows UI updates to show progress between batches
+    
+    except Exception as e:
+        st.session_state.optimization_progress[task_id]['status'] = 'error'
+        st.session_state.optimization_progress[task_id]['message'] = f"Error: {str(e)}"
+        st.error(f"Error executing batch: {str(e)}")
+        
+        # Move task to completed tasks with error status
+        task['status'] = 'error'
+        st.session_state.completed_tasks.append(task)
+        st.session_state.optimization_tasks = [t for t in st.session_state.optimization_tasks if t['id'] != task_id]
+
+def cancel_optimization_task(task_id):
+    """
+    Cancel an optimization task.
+    
+    Args:
+        task_id: ID of task to cancel
+    """
+    # Find the task in session state
+    task_found = False
+    for task in st.session_state.optimization_tasks:
+        if task['id'] == task_id:
+            task_found = True
+            task['status'] = 'cancelled'
+            
+            # Move to completed tasks with cancelled status
+            task_copy = task.copy()
+            st.session_state.completed_tasks.append(task_copy)
+            
+            # Remove from running tasks
+            st.session_state.optimization_tasks = [t for t in st.session_state.optimization_tasks if t['id'] != task_id]
+            
+            # Update progress
+            if task_id in st.session_state.optimization_progress:
+                st.session_state.optimization_progress[task_id]['status'] = 'cancelled'
+                st.session_state.optimization_progress[task_id]['message'] = 'Task cancelled by user'
+            
+            st.success(f"Task {task_id[:8]} has been cancelled.")
+            break
+    
+    if not task_found:
+        st.error(f"Task {task_id[:8]} not found or already completed.")
+    
+    return
+
+def check_and_run_pending_tasks():
+    """Check for pending optimization tasks and run the next batch of one task."""
+    # Debug print to see if this function is running
+    print("\n=== Checking for pending tasks ===")
+    print(f"Active task count: {len(st.session_state.optimization_tasks)}")
+    print(f"Task progress entries: {len(st.session_state.optimization_progress)}")
+    
+    # First check if there's a task flagged for execution
+    if hasattr(st.session_state, 'execute_next_task') and st.session_state.execute_next_task:
+        task_id = st.session_state.execute_next_task
+        print(f"Found task flagged for execution: {task_id[:8]}")
+        
+        # Find the task
+        task = None
+        for t in st.session_state.optimization_tasks:
+            if t['id'] == task_id:
+                task = t
+                break
+        
+        if task:
+            try:
+                # Get the price data from session state
+                price_data_key = f"price_data_{task_id}"
+                if price_data_key in st.session_state:
+                    price_data = st.session_state[price_data_key]
+                    print(f"Retrieved price data from session state, shape: {price_data.shape}")
+                    
+                    # Execute the batch
+                    execute_batch(task_id, price_data)
+                    
+                    # Clear the flag
+                    st.session_state.execute_next_task = None
+                    
+                    return True
+                else:
+                    print(f"Error: Price data not found in session state for task {task_id[:8]}")
+                    st.session_state.optimization_progress[task_id]['status'] = 'error'
+                    st.session_state.optimization_progress[task_id]['message'] = 'Price data not found in session state'
+            except Exception as e:
+                import traceback
+                print(f"Error executing flagged task {task_id[:8]}: {str(e)}")
+                print(traceback.format_exc())
+                
+                # Mark task as error
+                st.session_state.optimization_progress[task_id]['status'] = 'error'
+                st.session_state.optimization_progress[task_id]['message'] = f"Error: {str(e)}"
+                
+                # Clear the flag
+                st.session_state.execute_next_task = None
+        else:
+            print(f"Error: Flagged task {task_id[:8]} not found in task list")
+            st.session_state.execute_next_task = None
+    
+    # If no flagged task, check for any pending or running tasks
+    for task_id, progress in st.session_state.optimization_progress.items():
+        status = progress.get('status')
+        print(f"Found task {task_id[:8]} with status: {status}")
+        
+        if status == 'pending' or status == 'running':
+            # Find the task
+            task = None
+            for t in st.session_state.optimization_tasks:
+                if t['id'] == task_id:
+                    task = t
+                    break
+            
+            if task:
+                try:
+                    # Process one batch of this task
+                    current_batch = st.session_state.optimization_progress[task_id].get('current_batch', 0)
+                    total_batches = len(task.get('batches', []))
+                    print(f"Processing batch {current_batch + 1}/{total_batches} for task {task_id[:8]}")
+                    
+                    # Get the price data from session state
+                    price_data_key = f"price_data_{task_id}"
+                    if price_data_key in st.session_state:
+                        price_data = st.session_state[price_data_key]
+                        print(f"Retrieved price data from session state, shape: {price_data.shape}")
+                        
+                        execute_batch(task_id, price_data)
+                        # Return after processing one task to avoid running multiple tasks in one cycle
+                        return True
+                    else:
+                        print(f"Warning: No price data available for task {task_id[:8]}")
+                        # Mark task as error
+                        st.session_state.optimization_progress[task_id]['status'] = 'error'
+                        st.session_state.optimization_progress[task_id]['message'] = 'No price data available'
+                except Exception as e:
+                    import traceback
+                    print(f"Error processing task {task_id[:8]}: {str(e)}")
+                    print(traceback.format_exc())
+                    
+                    # Mark task as error
+                    st.session_state.optimization_progress[task_id]['status'] = 'error'
+                    st.session_state.optimization_progress[task_id]['message'] = f"Error: {str(e)}"
+            else:
+                print(f"Task {task_id[:8]} exists in progress tracking but not in task list")
+        
+    print("=== No pending tasks found to process ===\n")
+    return False
+
+def main():
+    # Check for and process pending tasks first
+    processed_task = check_and_run_pending_tasks()
+    
+    # Continue with the rest of the UI
+    st.title("Automated Optimization System")
+    st.markdown("""
+    This tool automates the process of finding optimal strategy parameters through:
+    
+    - **Hierarchical optimization** - Start broad, then focus on promising areas
+    - **Multi-condition testing** - Test parameters across different market conditions
+    - **Background processing** - Run optimizations while you work on other things
+    """)
+    
+    # Sidebar: Data selection and optimization settings
+    with st.sidebar:
+        st.header("Data Source")
+        
+        # Data source selection (file list or date range)
+        data_source = st.radio("Select data source", ["Use saved data file", "Fetch data for date range"])
+        
+        if data_source == "Use saved data file":
+            # List available data files
+            data_dir = "data"
+            if not os.path.exists(data_dir):
+                os.makedirs(data_dir)
+            
+            data_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
+            
+            if data_files:
+                selected_file = st.selectbox("Select data file", data_files)
+                filepath = os.path.join(data_dir, selected_file)
+                
+                if os.path.exists(filepath):
+                    with st.spinner("Loading data..."):
+                        df = data_fetcher.load_data(filepath)
+                        if df is not None:
+                            st.success(f"Loaded {len(df)} rows of data")
+                            # Show data summary
+                            if not df.empty:
+                                st.write(f"Date range: {df.index[0].date()} to {df.index[-1].date()}")
+                                
+                                # Calculate days of data
+                                days = (df.index[-1] - df.index[0]).days
+                                st.write(f"Total days: {days}")
+            else:
+                st.warning("No data files found. Upload CSV files to the 'data' directory.")
+                df = None
+        
+        else:  # Date range option
+            st.write("Fetch data for a specific date range")
+            # Date selection
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=365)
+            
+            start_date = st.date_input("Start date", value=start_date)
+            end_date = st.date_input("End date", value=end_date)
+            
+            symbol = st.text_input("Trading pair", value="BTC/USDT")
+            exchange = st.selectbox("Exchange", ["binance", "bitstamp", "coinbase", "kraken"], index=0)
+            timeframe = st.selectbox("Timeframe", ["15m", "1h", "4h", "1d"], index=1)
+            
+            if st.button("Fetch Data"):
+                with st.spinner("Fetching data..."):
+                    # Convert dates to datetime objects
+                    start_datetime = datetime.combine(start_date, datetime.min.time())
+                    end_datetime = datetime.combine(end_date, datetime.min.time())
+                    
+                    # Fetch data
+                    df = data_fetcher.fetch_historical_data(
+                        exchange_id=exchange,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        start_date=start_datetime,
+                        end_date=end_datetime
+                    )
+                    
+                    if df is not None and not df.empty:
+                        st.success(f"Fetched {len(df)} rows of data")
+                        # Show data summary
+                        st.write(f"Date range: {df.index[0].date()} to {df.index[-1].date()}")
+                        
+                        # Calculate days of data
+                        days = (df.index[-1] - df.index[0]).days
+                        st.write(f"Total days: {days}")
+                        
+                        # Option to save data
+                        save_filename = f"{exchange}_{symbol.replace('/', '')}_{timeframe}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv"
+                        if st.button(f"Save as {save_filename}"):
+                            save_path = os.path.join("data", save_filename)
+                            df.to_csv(save_path)
+                            st.success(f"Data saved to {save_path}")
+                    else:
+                        st.error("Failed to fetch data. Please check your inputs and try again.")
+                        df = None
+        
+        # Optimization settings
+        st.header("Optimization Settings")
+        initial_capital = st.number_input("Initial Capital (USDT)", min_value=100.0, max_value=100000.0, value=1000.0, step=500.0)
+        
+    # Main content tabs
+    tab1, tab2, tab3 = st.tabs(["Create Optimization", "Running Tasks", "Completed Optimizations"])
+    
+    with tab1:
+        st.header("Create New Optimization")
+        
+        # Quick Test Button for easy testing
+        if st.button("🚀 Quick Test (Small Optimization)"):
+            if 'df' in locals() and df is not None and not df.empty:
+                # Define default parameters
+                default_params = {
+                    'investment_pct': 20.0,
+                    'price_drop_threshold': 2.0,
+                    'profit_threshold': 3.0,
+                    'stop_loss_fixed_pct': 15.0,
+                    'trailing_stop_pct': 1.5,
+                    'max_position_duration': 180,
+                    'min_trade_size': 50.0,
+                    'trailing_stop_activation_pct': 1.5
+                }
+                
+                # Create a quick test batch with minimal combinations
+                quick_batch = {
+                    'name': "Quick Test",
+                    'description': "A small test with minimal parameter combinations",
+                    'optimize': {
+                        'investment_pct': [10.0, 20.0],
+                        'price_drop_threshold': [2.0, 3.0],
+                        'profit_threshold': [3.0]
+                    },
+                    'fixed': default_params,
+                    'max_combinations': 4
+                }
+                
+                # Create and start task
+                task_id = start_optimization_task([quick_batch], df, initial_capital, False)
+                st.success(f"Started quick test optimization (Task ID: {task_id})")
+                
+                # Switch to running tasks tab
+                st.info("Please switch to 'Running Tasks' tab to monitor progress.")
+            else:
+                st.error("No data available. Please select or fetch data first.")
+        
+        # Optimization type selection
+        optimization_type = st.radio(
+            "Optimization Type",
+            ["Hierarchical Parameter Search", "Market Condition Testing", "Custom Batch Optimization"]
+        )
+        
+        if optimization_type == "Hierarchical Parameter Search":
+            st.markdown("""
+            **Hierarchical Parameter Search** uses a three-stage process:
+            1. **Wide Exploration** - Test broad parameter ranges to identify promising regions
+            2. **Focused Exploration** - Narrow down to the most effective parameter ranges
+            3. **Precise Tuning** - Fine-tune the best performing parameter combinations
+            
+            This approach efficiently finds optimal parameters without testing all possible combinations.
+            """)
+            
+            # Option to use existing results as starting point
+            use_existing = st.checkbox("Use existing optimization results as starting point", value=False)
+            
+            if use_existing:
+                # Load available optimization results
+                optimization_files = results_manager.list_optimization_results()
+                
+                if optimization_files:
+                    # Show list of available results
+                    options = [f"{meta.get('timestamp', 'Unknown Date')} - {meta.get('strategy', 'Unknown Strategy')}" for meta in optimization_files]
+                    selected_result = st.selectbox("Select starting point", options)
+                    
+                    # Get selected result metadata
+                    selected_idx = options.index(selected_result)
+                    result_meta = optimization_files[selected_idx]
+                    
+                    # Load result data
+                    result_data = results_manager.load_optimization_results(result_meta['filepath'])
+                    
+                    # Get best parameters as starting point
+                    if 'results' in result_data and result_data['results']:
+                        best_result = max(result_data['results'], key=lambda x: x['metrics']['return_pct'])
+                        initial_params = best_result['parameters']
+                        
+                        # Display best parameters
+                        st.markdown("#### Starting Parameters")
+                        for param, value in initial_params.items():
+                            st.write(f"- **{param}**: {value}")
+                    else:
+                        st.warning("No results found in selected file.")
+                        initial_params = None
+                else:
+                    st.warning("No optimization results found.")
+                    initial_params = None
+            else:
+                initial_params = None
+            
+            # Create hierarchical batches
+            batches = create_hierarchical_batches(initial_params)
+            
+            # Show batch configuration
+            st.markdown("#### Optimization Stages")
+            for i, batch in enumerate(batches):
+                with st.expander(f"Stage {i+1}: {batch['name']}"):
+                    st.write(f"**Description:** {batch['description']}")
+                    st.write(f"**Maximum combinations:** {batch['max_combinations']}")
+                    
+                    # Display parameter ranges
+                    st.markdown("**Parameter Ranges:**")
+                    param_cols = st.columns(2)
+                    
+                    for j, (param, values) in enumerate(batch['optimize'].items()):
+                        with param_cols[j % 2]:
+                            st.write(f"- **{param}**: {values}")
+                    
+                    # Display fixed parameters
+                    st.markdown("**Fixed Parameters:**")
+                    for param, value in batch['fixed'].items():
+                        st.write(f"- **{param}**: {value}")
+            
+            # Auto-adjust option
+            auto_adjust = st.checkbox("Automatically adjust parameter ranges between stages", value=True)
+            
+            # Start optimization button
+            if st.button("Start Hierarchical Optimization"):
+                if 'df' in locals() and df is not None and not df.empty:
+                    # Create and start task
+                    task_id = start_optimization_task(batches, df, initial_capital, auto_adjust)
+                    st.success(f"Started hierarchical optimization (Task ID: {task_id})")
+                    
+                    # Switch to running tasks tab
+                    st.markdown("Switched to 'Running Tasks' tab to monitor progress.")
+                else:
+                    st.error("No data available. Please select or fetch data first.")
+        
+        elif optimization_type == "Market Condition Testing":
+            st.markdown("""
+            **Market Condition Testing** evaluates parameter performance across different market conditions:
+            - Bull markets (strong uptrends)
+            - Bear markets (prolonged downtrends)
+            - Sideways markets (ranging price action)
+            - Volatile markets (large price swings)
+            - Recent market conditions
+            
+            This helps identify parameters that perform well in multiple market environments.
+            """)
+            
+            # Select parameters to test
+            st.markdown("#### Parameters to Test")
+            st.write("Select a base parameter set to test across market conditions:")
+            
+            # Option to load existing best parameters
+            load_option = st.radio(
+                "Parameters Source",
+                ["Use best parameters from previous optimization", "Manual parameter input"]
+            )
+            
+            if load_option == "Use best parameters from previous optimization":
+                # Load available optimization results
+                optimization_files = results_manager.list_optimization_results()
+                
+                if optimization_files:
+                    # Show list of available results
+                    options = [f"{meta.get('timestamp', 'Unknown Date')} - {meta.get('strategy', 'Unknown Strategy')}" for meta in optimization_files]
+                    selected_result = st.selectbox("Select optimization result", options)
+                    
+                    # Get selected result metadata
+                    selected_idx = options.index(selected_result)
+                    result_meta = optimization_files[selected_idx]
+                    
+                    # Load result data
+                    result_data = results_manager.load_optimization_results(result_meta['filepath'])
+                    
+                    # Get best parameters
+                    if 'results' in result_data and result_data['results']:
+                        best_result = max(result_data['results'], key=lambda x: x['metrics']['return_pct'])
+                        test_params = best_result['parameters']
+                        
+                        # Display parameters
+                        st.markdown("**Parameters to Test:**")
+                        for param, value in test_params.items():
+                            st.write(f"- **{param}**: {value}")
+                    else:
+                        st.warning("No results found in selected file.")
+                        test_params = DEFAULT_FIXED_PARAMS.copy()
+                else:
+                    st.warning("No optimization results found.")
+                    test_params = DEFAULT_FIXED_PARAMS.copy()
+            else:
+                # Manual parameter input
+                test_params = {}
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    test_params['investment_pct'] = st.number_input("Investment Percentage (%)", value=10.0, min_value=1.0, max_value=50.0)
+                    test_params['price_drop_threshold'] = st.number_input("Price Drop Threshold (%)", value=2.0, min_value=0.1, max_value=10.0)
+                    test_params['profit_threshold'] = st.number_input("Profit Threshold (%)", value=3.0, min_value=0.5, max_value=20.0)
+                    test_params['stop_loss_fixed_pct'] = st.number_input("Stop Loss (%)", value=15.0, min_value=5.0, max_value=30.0)
+                
+                with col2:
+                    test_params['trailing_stop_pct'] = st.number_input("Trailing Stop (%)", value=1.5, min_value=0.1, max_value=5.0)
+                    test_params['max_position_duration'] = st.number_input("Max Position Duration (days)", value=180, min_value=1, max_value=365)
+                    test_params['number_of_bots'] = st.number_input("Number of Bots", value=3, min_value=1, max_value=10)
+                    test_params['min_trade_size'] = st.number_input("Minimum Trade Size (USDT)", value=50.0, min_value=10.0, max_value=200.0)
+                
+                # Add fixed parameters
+                test_params['trading_fee_pct'] = 0.1
+                test_params['partial_profit_taking'] = False
+                test_params['profit_taking_percentage'] = 50.0
+                test_params['use_trailing_stop_main'] = True
+            
+            # Market condition selection
+            st.markdown("#### Market Conditions to Test")
+            selected_conditions = st.multiselect(
+                "Select market conditions",
+                list(MARKET_CONDITION_PRESETS.keys()),
+                default=list(MARKET_CONDITION_PRESETS.keys()),
+                format_func=lambda x: x.replace('_', ' ').title()
+            )
+            
+            # Show condition details
+            if selected_conditions:
+                st.markdown("**Selected Market Conditions:**")
+                for condition in selected_conditions:
+                    dates = MARKET_CONDITION_PRESETS[condition]
+                    st.write(f"- **{condition.replace('_', ' ').title()}**: {dates['start_date']} to {dates['end_date']}")
+            
+            # Create batches
+            if test_params:
+                # Filter selected conditions
+                filtered_conditions = {k: v for k, v in MARKET_CONDITION_PRESETS.items() if k in selected_conditions}
+                
+                # Create market condition batches
+                batches = []
+                for condition, dates in filtered_conditions.items():
+                    # Create small variations around best parameters
+                    optimize = {}
+                    for param in ['investment_pct', 'price_drop_threshold', 'profit_threshold', 'stop_loss_fixed_pct']:
+                        if param in test_params:
+                            value = test_params[param]
+                            if isinstance(value, int):
+                                optimize[param] = [value, value + 1, value - 1]
+                            elif isinstance(value, float):
+                                optimize[param] = [value, value * 1.1, value * 0.9]
+                            else:
+                                optimize[param] = [value]
+                    
+                    # Create batch
+                    batches.append({
+                        'name': f"Market Condition: {condition.replace('_', ' ').title()}",
+                        'description': f"Testing parameters in {condition.replace('_', ' ')} conditions ({dates['start_date']} to {dates['end_date']})",
+                        'optimize': optimize,
+                        'fixed': {k: v for k, v in test_params.items() if k not in optimize},
+                        'max_combinations': 27,  # 3^3 combinations
+                        'date_range': dates
+                    })
+                
+                # Start optimization button
+                if st.button("Start Market Condition Testing"):
+                    if 'df' in locals() and df is not None and not df.empty:
+                        # Create and start task
+                        task_id = start_optimization_task(batches, df, initial_capital, False)
+                        st.success(f"Started market condition testing (Task ID: {task_id})")
+                        
+                        # Switch to running tasks tab
+                        st.markdown("Switched to 'Running Tasks' tab to monitor progress.")
+                    else:
+                        st.error("No data available. Please select or fetch data first.")
+        
+        else:  # Custom batch optimization
+            st.markdown("""
+            **Custom Batch Optimization** lets you define your own parameter combinations to test:
+            - Specify exactly which parameters to optimize
+            - Set custom ranges for each parameter
+            - Create multiple batches with different configurations
+            
+            This gives you complete control over the optimization process.
+            """)
+            
+            # Custom batch configuration
+            st.markdown("#### Custom Batch Configuration")
+            
+            # Initialize session state for custom batches
+            if 'custom_batches' not in st.session_state:
+                st.session_state.custom_batches = []
+            
+            # Create new batch form
+            with st.form("new_batch_form"):
+                st.subheader("Create New Batch")
+                
+                batch_name = st.text_input("Batch Name", f"Custom Batch {len(st.session_state.custom_batches) + 1}")
+                batch_description = st.text_area("Description", "Custom parameter optimization batch")
+                max_combinations = st.number_input("Maximum Combinations", min_value=10, max_value=1000, value=100)
+                
+                # Parameters to optimize
+                st.markdown("**Parameters to Optimize**")
+                optimize_params = {}
+                
+                # Create parameter input fields
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Investment percentage
+                    if st.checkbox("Optimize Investment Percentage", value=True):
+                        inv_min = st.number_input("Min Investment %", value=5.0, min_value=1.0, max_value=50.0)
+                        inv_max = st.number_input("Max Investment %", value=40.0, min_value=1.0, max_value=50.0)
+                        inv_steps = st.number_input("Steps", value=4, min_value=2, max_value=10)
+                        
+                        # Generate values
+                        if inv_min < inv_max:
+                            optimize_params['investment_pct'] = np.linspace(inv_min, inv_max, int(inv_steps)).tolist()
+                    
+                    # Price drop threshold
+                    if st.checkbox("Optimize Price Drop Threshold", value=True):
+                        drop_min = st.number_input("Min Drop Threshold %", value=0.5, min_value=0.1, max_value=10.0)
+                        drop_max = st.number_input("Max Drop Threshold %", value=5.0, min_value=0.1, max_value=10.0)
+                        drop_steps = st.number_input("Drop Steps", value=4, min_value=2, max_value=10)
+                        
+                        # Generate values
+                        if drop_min < drop_max:
+                            optimize_params['price_drop_threshold'] = np.linspace(drop_min, drop_max, int(drop_steps)).tolist()
+                    
+                    # Profit threshold
+                    if st.checkbox("Optimize Profit Threshold", value=True):
+                        profit_min = st.number_input("Min Profit Threshold %", value=1.0, min_value=0.5, max_value=20.0)
+                        profit_max = st.number_input("Max Profit Threshold %", value=5.0, min_value=0.5, max_value=20.0)
+                        profit_steps = st.number_input("Profit Steps", value=3, min_value=2, max_value=10)
+                        
+                        # Generate values
+                        if profit_min < profit_max:
+                            optimize_params['profit_threshold'] = np.linspace(profit_min, profit_max, int(profit_steps)).tolist()
+                
+                with col2:
+                    # Stop loss
+                    if st.checkbox("Optimize Stop Loss", value=True):
+                        sl_min = st.number_input("Min Stop Loss %", value=10.0, min_value=5.0, max_value=30.0)
+                        sl_max = st.number_input("Max Stop Loss %", value=25.0, min_value=5.0, max_value=30.0)
+                        sl_steps = st.number_input("SL Steps", value=4, min_value=2, max_value=10)
+                        
+                        # Generate values
+                        if sl_min < sl_max:
+                            optimize_params['stop_loss_fixed_pct'] = np.linspace(sl_min, sl_max, int(sl_steps)).tolist()
+                    
+                    # Trailing stop
+                    if st.checkbox("Optimize Trailing Stop", value=True):
+                        ts_min = st.number_input("Min Trailing Stop %", value=0.5, min_value=0.1, max_value=5.0)
+                        ts_max = st.number_input("Max Trailing Stop %", value=3.0, min_value=0.1, max_value=5.0)
+                        ts_steps = st.number_input("TS Steps", value=3, min_value=2, max_value=10)
+                        
+                        # Generate values
+                        if ts_min < ts_max:
+                            optimize_params['trailing_stop_pct'] = np.linspace(ts_min, ts_max, int(ts_steps)).tolist()
+                    
+                    # Number of bots
+                    if st.checkbox("Optimize Number of Bots", value=True):
+                        bot_min = st.number_input("Min Bots", value=1, min_value=1, max_value=10)
+                        bot_max = st.number_input("Max Bots", value=5, min_value=1, max_value=10)
+                        
+                        # Generate values
+                        if bot_min <= bot_max:
+                            optimize_params['number_of_bots'] = list(range(int(bot_min), int(bot_max) + 1))
+                
+                # Fixed parameters
+                st.markdown("**Fixed Parameters**")
+                
+                # Trading fee
+                trading_fee = st.number_input("Trading Fee %", value=0.1, min_value=0.0, max_value=1.0)
+                
+                # Min trade size
+                min_trade_size = st.number_input("Min Trade Size (USDT)", value=50.0, min_value=10.0, max_value=200.0)
+                
+                # Submit button
+                submitted = st.form_submit_button("Add Batch")
+                
+                if submitted:
+                    # Create fixed parameters
+                    fixed_params = {
+                        'trading_fee_pct': trading_fee,
+                        'min_trade_size': min_trade_size,
+                        'partial_profit_taking': False,
+                        'profit_taking_percentage': 50.0,
+                        'use_trailing_stop_main': True
+                    }
+                    
+                    # Add parameters that aren't being optimized
+                    for param in ['investment_pct', 'price_drop_threshold', 'profit_threshold', 
+                                 'stop_loss_fixed_pct', 'trailing_stop_pct', 'number_of_bots']:
+                        if param not in optimize_params:
+                            # Add default value
+                            if param == 'investment_pct':
+                                fixed_params[param] = 10.0
+                            elif param == 'price_drop_threshold':
+                                fixed_params[param] = 2.0
+                            elif param == 'profit_threshold':
+                                fixed_params[param] = 3.0
+                            elif param == 'stop_loss_fixed_pct':
+                                fixed_params[param] = 15.0
+                            elif param == 'trailing_stop_pct':
+                                fixed_params[param] = 1.5
+                            elif param == 'number_of_bots':
+                                fixed_params[param] = 1
+                    
+                    # Create batch
+                    new_batch = {
+                        'name': batch_name,
+                        'description': batch_description,
+                        'optimize': optimize_params,
+                        'fixed': fixed_params,
+                        'max_combinations': max_combinations
+                    }
+                    
+                    # Show warning if too many combinations
+                    total_combinations = 1
+                    for values in optimize_params.values():
+                        total_combinations *= len(values)
+                    
+                    if total_combinations > max_combinations:
+                        st.warning(f"This batch has {total_combinations} total combinations, but will be limited to {max_combinations}.")
+                    
+                    # Add batch to session state
+                    st.session_state.custom_batches.append(new_batch)
+                    st.success(f"Added batch: {batch_name}")
+            
+            # Display existing batches
+            if st.session_state.custom_batches:
+                st.markdown("#### Configured Batches")
+                
+                for i, batch in enumerate(st.session_state.custom_batches):
+                    with st.expander(f"{i+1}. {batch['name']}"):
+                        st.write(f"**Description:** {batch['description']}")
+                        st.write(f"**Maximum combinations:** {batch['max_combinations']}")
+                        
+                        # Display parameter ranges
+                        st.markdown("**Parameter Ranges:**")
+                        for param, values in batch['optimize'].items():
+                            st.write(f"- **{param}**: {values}")
+                        
+                        # Display fixed parameters
+                        st.markdown("**Fixed Parameters:**")
+                        for param, value in batch['fixed'].items():
+                            st.write(f"- **{param}**: {value}")
+                        
+                        # Remove button
+                        if st.button(f"Remove Batch {i+1}"):
+                            st.session_state.custom_batches.pop(i)
+                            st.rerun()
+                
+                # Start optimization button
+                if st.button("Start Custom Optimization"):
+                    if 'df' in locals() and df is not None and not df.empty:
+                        # Create and start task
+                        task_id = start_optimization_task(st.session_state.custom_batches, df, initial_capital, False)
+                        st.success(f"Started custom optimization (Task ID: {task_id})")
+                        
+                        # Switch to running tasks tab
+                        st.markdown("Switched to 'Running Tasks' tab to monitor progress.")
+                        
+                        # Clear batches
+                        st.session_state.custom_batches = []
+                    else:
+                        st.error("No data available. Please select or fetch data first.")
+            else:
+                st.info("Add at least one batch to start optimization.")
+    
+    with tab2:
+        st.header("Running Optimization Tasks")
+        
+        # Get running tasks - only include tasks that are not completed and still have status as "running"
+        running_tasks = []
+        for task in st.session_state.optimization_tasks:
+            # Check if task is already in completed tasks
+            if task['id'] in [t['id'] for t in st.session_state.completed_tasks]:
+                continue
+                
+            # Check task status in optimization_progress
+            if task['id'] in st.session_state.optimization_progress:
+                progress_status = st.session_state.optimization_progress[task['id']].get('status', '')
+                # Only include if status is not "completed"
+                if progress_status != 'completed':
+                    running_tasks.append(task)
+            else:
+                # If no progress info, consider it running
+                running_tasks.append(task)
+        
+        # Also include current task if it exists
+        if st.session_state.current_task:
+            task_id = st.session_state.current_task['id']
+            
+            # Skip if already in completed tasks
+            if task_id in [t['id'] for t in st.session_state.completed_tasks]:
+                pass
+            # Check if the task is already in running_tasks
+            elif any(t['id'] == task_id for t in running_tasks):
+                pass
+            # Check status in optimization_progress
+            elif task_id in st.session_state.optimization_progress:
+                progress_status = st.session_state.optimization_progress[task_id].get('status', '')
+                if progress_status != 'completed':
+                    running_tasks.append(st.session_state.current_task)
+            else:
+                # If no progress info, consider it running
+                running_tasks.append(st.session_state.current_task)
+        
+        # For debugging, log task counts
+        print(f"Running tasks: {len(running_tasks)}, Optimization tasks: {len(st.session_state.optimization_tasks)}, Completed tasks: {len(st.session_state.completed_tasks)}")
+        
+        if running_tasks:
+            st.write(f"Number of running tasks: {len(running_tasks)}")
+            for task in running_tasks:
+                task_id = task['id']
+                progress = st.session_state.optimization_progress.get(task_id, {})
+                
+                # Create task container
+                with st.container():
+                    # Task header
+                    st.subheader(f"Task: {task_id[:8]}")
+                    
+                    # Show task status prominently
+                    status = progress.get('status', 'unknown')
+                    
+                    # Task status with animated spinner for running tasks
+                    cols = st.columns([3, 7])
+                    with cols[0]:
+                        if status == 'running':
+                            st.markdown("#### :blue[⟳ Running]")
+                        elif status == 'error':
+                            st.markdown("#### :red[❌ Error]")
+                        elif status == 'completed':
+                            st.markdown("#### :green[✓ Completed]")
+                        else:
+                            st.markdown(f"#### Status: {status}")
+                    
+                    with cols[1]:
+                        st.markdown(f"**{progress.get('message', '')}**")
+                    
+                    # Animation and progress display
+                    if status == 'running':
+                        # Create an animated progress container with custom styling
+                        st.markdown("""
+                        <style>
+                        @keyframes pulse {
+                            0% { opacity: 0.5; }
+                            50% { opacity: 1; }
+                            100% { opacity: 0.5; }
+                        }
+                        .animated-progress {
+                            animation: pulse 1.5s infinite ease-in-out;
+                            padding: 8px 16px;
+                            border-radius: 4px;
+                            background-color: rgba(0, 104, 201, 0.1);
+                            border-left: 4px solid #0068c9;
+                            margin-bottom: 16px;
+                        }
+                        
+                        .hourglass-icon {
+                            display: inline-block;
+                            font-size: 1.2em;
+                            margin-right: 8px;
+                        }
+                        
+                        .progress-text {
+                            font-size: 1.2em;
+                            font-weight: 500;
+                            color: #333;
+                            margin: 5px 0;
+                        }
+                        
+                        .running-text {
+                            display: inline-block;
+                            color: #0068c9;
+                            font-weight: 600;
+                        }
+                        
+                        .batch-title {
+                            margin-bottom: 10px;
+                            font-weight: 600;
+                        }
+                        
+                        .parameter-info {
+                            padding: 8px;
+                            background-color: #f0f7fb;
+                            border-radius: 4px;
+                            margin-top: 10px;
+                            border-left: 3px solid #0068c9;
+                        }
+                        </style>
+                        """, unsafe_allow_html=True)
+                        
+                        # Progress bar for overall progress with percentage
+                        # Calculate the accurate overall progress
+                        current_batch = progress.get('current_batch', 0) 
+                        batch_progress = progress.get('batch_progress', 0)
+                        total_batches = len(task.get('batches', []))
+                        
+                        # Fix: Calculate accurate progress based on current batch and batch progress
+                        # If all batches complete, show 100%. Otherwise, show progress as a fraction of total
+                        if current_batch >= total_batches:
+                            overall_progress = 1.0
+                            # Make sure the status is set to completed when progress is 100%
+                            if status != 'completed':
+                                st.session_state.optimization_progress[task_id]['status'] = 'completed'
+                                st.session_state.optimization_progress[task_id]['message'] = 'All batches completed'
+                                
+                                # If the task is 100% complete but not in completed_tasks, move it
+                                if task not in st.session_state.completed_tasks:
+                                    st.session_state.completed_tasks.append(task)
+                                    # Remove from optimization_tasks if present
+                                    st.session_state.optimization_tasks = [t for t in st.session_state.optimization_tasks if t['id'] != task_id]
+                        else:
+                            # Each batch contributes 1/total_batches to the overall progress
+                            # Completed batches contribute fully, current batch contributes partially
+                            overall_progress = (current_batch + batch_progress) / total_batches
+                        
+                        # Make sure progress is between 0 and 1
+                        overall_progress = max(0.0, min(1.0, overall_progress))
+                        progress_pct = int(overall_progress * 100)
+                        
+                        # Display batch number
+                        display_batch = min(current_batch + 1, total_batches)
+                        
+                        # Get the current batch data
+                        batch_name = "Unknown"
+                        if current_batch < len(task.get('batches', [])):
+                            batch_name = task.get('batches', [])[current_batch].get('name', "Unnamed Batch")
+                        
+                        # Display both hourglass icon and progress text in improved layout
+                        st.markdown(f"""
+                        <div class="animated-progress">
+                            <h4>⏳ Optimization in Progress: {progress_pct}% Complete</h4>
+                            <p>Running parameter combinations... {display_batch} of {total_batches} batches. Please wait.</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # Create an animated progress bar with continuous movement
+                        progress_container = st.empty()
+                        # We'll display the actual progress but add animation effect within CSS
+                        st.markdown("""
+                        <style>
+                        /* Add animation to progress bars */
+                        .stProgress > div > div {
+                            background-image: linear-gradient(
+                                to right,
+                                rgba(0, 104, 201, 0.8),
+                                rgba(26, 150, 255, 0.8),
+                                rgba(0, 104, 201, 0.8)
+                            );
+                            background-size: 200% 100%;
+                            animation: progress-bar-animation 2s infinite linear;
+                        }
+                        
+                        @keyframes progress-bar-animation {
+                            0% { background-position: 100% 0; }
+                            100% { background-position: -100% 0; }
+                        }
+                        </style>
+                        """, unsafe_allow_html=True)
+                        
+                        # Check if the task is actually in progress
+                        if progress.get('status', '') == 'completed':
+                            # If completed, show 100%
+                            progress_container.progress(1.0)
+                        else:
+                            # For in-progress tasks, show the actual progress
+                            # Make sure we never show 100% unless truly complete
+                            display_progress = min(0.99, overall_progress) if overall_progress < 1.0 else overall_progress
+                            progress_container.progress(display_progress)
+                        
+                        # Display current batch info in a more structured way
+                        st.markdown(f"## Batch {display_batch}/{total_batches}")
+                        
+                        # Display the batch name in a more prominent way
+                        st.markdown(f"### Running batch: {batch_name}")
+                        
+                        # Batch progress with visual indicator
+                        batch_progress = progress.get('batch_progress', 0)
+                        
+                        # Ensure batch progress doesn't show 100% unless the batch is truly complete
+                        if progress.get('status', '') == 'completed':
+                            batch_progress = 1.0
+                        elif current_batch >= total_batches:
+                            batch_progress = 1.0
+                        elif batch_progress > 0.99 and current_batch < total_batches - 1:
+                            # Cap at 99% if not the last batch
+                            batch_progress = 0.99
+                            
+                        batch_pct = int(batch_progress * 100)
+                        
+                        # Get current combination parameters being tested if available
+                        current_params = {}
+                        message = progress.get('message', '')
+                        # Try to extract parameter info from the message if available
+                        if task.get('current_params', None):
+                            current_params = task.get('current_params')
+                        
+                        # Show parameter info in a nice format
+                        if current_params:
+                            param_text = ", ".join([f"{k}={v}" for k, v in current_params.items()])
+                            st.markdown(f"""
+                            <div class="parameter-info">
+                                <p><strong>Testing combination:</strong> {param_text}</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        # Show batch progress with a styled box
+                        st.markdown(f"""
+                        <div style="margin-bottom: 15px;">
+                            <div style="font-weight: bold; margin-bottom: 5px;">
+                                Batch Progress: {batch_pct}%
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # Progress bar for batch progress
+                        st.progress(batch_progress)
+                        
+                        # Display Processing text
+                        st.markdown(f"Processing parameter combinations: **{batch_pct}%** complete")
+                        
+                        # Display timing information
+                        start_time = progress.get('start_time')
+                        elapsed_time = progress.get('elapsed_time', 0)
+                        remaining_time = progress.get('remaining_time')
+                        estimated_end_time = progress.get('estimated_end_time')
+                        
+                        # Create a prominent timing information box
+                        st.markdown("""
+                        <style>
+                        .timing-box {
+                            background-color: #f0f7ff;
+                            border-left: 4px solid #0068c9;
+                            padding: 15px;
+                            border-radius: 5px;
+                            margin: 15px 0;
+                        }
+                        .timing-title {
+                            font-size: 18px;
+                            font-weight: bold;
+                            margin-bottom: 10px;
+                            color: #0068c9;
+                        }
+                        .timing-row {
+                            display: flex;
+                            justify-content: space-between;
+                            margin-bottom: 8px;
+                        }
+                        .timing-label {
+                            font-weight: bold;
+                            color: #444;
+                        }
+                        .timing-value {
+                            font-weight: bold;
+                            color: #0068c9;
+                        }
+                        </style>
+                        """, unsafe_allow_html=True)
+                        
+                        # Format elapsed time nicely
+                        elapsed_hours = int(elapsed_time // 3600)
+                        elapsed_minutes = int((elapsed_time % 3600) // 60)
+                        elapsed_seconds = int(elapsed_time % 60)
+                        
+                        if elapsed_hours > 0:
+                            elapsed_str = f"{elapsed_hours}h {elapsed_minutes}m {elapsed_seconds}s"
+                        else:
+                            elapsed_str = f"{elapsed_minutes}m {elapsed_seconds}s"
+                        
+                        # Format remaining time nicely if available
+                        remaining_str = "Calculating..."
+                        if progress.get('remaining_time') is not None and progress.get('remaining_time') > 0:
+                            remaining_time = progress.get('remaining_time')
+                            remaining_hours = int(remaining_time // 3600)
+                            remaining_minutes = int((remaining_time % 3600) // 60)
+                            remaining_seconds = int(remaining_time % 60)
+                            
+                            if remaining_hours > 0:
+                                remaining_str = f"{remaining_hours}h {remaining_minutes}m {remaining_seconds}s"
+                            else:
+                                remaining_str = f"{remaining_minutes}m {remaining_seconds}s"
+                        
+                        # Format total time nicely if both elapsed and remaining are available
+                        total_time_str = "Calculating..."
+                        if progress.get('remaining_time') is not None and progress.get('remaining_time') > 0:
+                            total_time = elapsed_time + progress.get('remaining_time')
+                            total_hours = int(total_time // 3600)
+                            total_minutes = int((total_time % 3600) // 60)
+                            total_seconds = int(total_time % 60)
+                            
+                            if total_hours > 0:
+                                total_time_str = f"{total_hours}h {total_minutes}m {total_seconds}s"
+                            else:
+                                total_time_str = f"{total_minutes}m {total_seconds}s"
+                        
+                        # Format start and estimated end time with proper date if spanning multiple days
+                        start_time_str = start_time.strftime("%H:%M:%S") if start_time else "Unknown"
+                        
+                        # For estimated end time, include the date if it's different from today
+                        if progress.get('estimated_end_time'):
+                            estimated_end_time = progress.get('estimated_end_time')
+                            if estimated_end_time.date() == datetime.now().date():
+                                # Same day, just show time
+                                end_time_str = estimated_end_time.strftime("%H:%M:%S")
+                            else:
+                                # Different day, show date and time
+                                end_time_str = estimated_end_time.strftime("%Y-%m-%d %H:%M:%S")
+                        else:
+                            end_time_str = "Calculating..."
+                        
+                        # Create minutes display strings for easy reading
+                        elapsed_minutes_total = int(elapsed_time // 60)
+                        remaining_minutes_total = int(remaining_time // 60) if remaining_time and remaining_time > 0 else 0
+                        total_minutes = elapsed_minutes_total + remaining_minutes_total
+                        
+                        # Display timing information in a nice box with auto-refresh JavaScript
+                        # Add CSS style for timing elements
+                        st.markdown("""
+                        <style>
+                        .timing-box {
+                            background-color: #f8f9fa;
+                            border-radius: 8px;
+                            padding: 15px;
+                            margin-bottom: 20px;
+                            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+                        }
+                        .timing-title {
+                            font-size: 18px;
+                            font-weight: bold;
+                            margin-bottom: 15px;
+                            color: #333;
+                            text-align: center;
+                        }
+                        .timing-row {
+                            display: flex;
+                            justify-content: space-between;
+                            margin-bottom: 10px;
+                            padding: 8px;
+                            border-bottom: 1px solid #eee;
+                        }
+                        .timing-label {
+                            font-weight: bold;
+                            color: #555;
+                        }
+                        .timing-value {
+                            font-weight: normal;
+                            color: #0068c9;
+                        }
+                        </style>
+                        """, unsafe_allow_html=True)
+                        
+                        # Helper function for proper singular/plural forms
+                        def minute_text(count):
+                            return "minute" if count == 1 else "minutes"
+                            
+                        # Create styled timing information sections
+                        minutes_summary_html = f"""
+                        <div style="background-color: #e6f3ff; padding: 10px; border-radius: 5px; margin-bottom: 15px; border-left: 4px solid #0091ff;">
+                            <div style="font-size: 16px; font-weight: bold; margin-bottom: 5px; color: #0068c9;">
+                                ⏳ Time Summary (Minutes)
+                            </div>
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                                <span style="font-weight: bold;">Total Minutes:</span>
+                                <span style="font-weight: bold; color: #0068c9;">{total_minutes} {minute_text(total_minutes)}</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                                <span style="font-weight: bold;">Minutes Elapsed:</span>
+                                <span style="font-weight: bold; color: #0068c9;">{elapsed_minutes_total} {minute_text(elapsed_minutes_total)}</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between;">
+                                <span style="font-weight: bold;">Minutes Remaining:</span>
+                                <span style="font-weight: bold; color: #0068c9;">{remaining_minutes_total} {minute_text(remaining_minutes_total)}</span>
+                            </div>
+                        </div>
+                        """
+                            
+                        # Split into two parts to avoid conflicts with JavaScript curly braces
+                        timing_html = f"""
+                        <div class="timing-box">
+                            <div class="timing-title">⏱️ Optimization Timing Details</div>
+                        """
+                        
+                        # Add the minutes summary section
+                        timing_html += minutes_summary_html
+                        
+                        # Create detailed timing section
+                        detailed_timing_html = f"""
+                        <div class="timing-row">
+                            <span class="timing-label">Elapsed Time:</span>
+                            <span class="timing-value">{elapsed_str}</span>
+                        </div>
+                        <div class="timing-row">
+                            <span class="timing-label">Remaining Time:</span>
+                            <span class="timing-value">{remaining_str}</span>
+                        </div>
+                        <div class="timing-row">
+                            <span class="timing-label">Total Time:</span>
+                            <span class="timing-value">{total_time_str}</span>
+                        </div>
+                        <div class="timing-row">
+                            <span class="timing-label">Started at:</span>
+                            <span class="timing-value">{start_time_str}</span>
+                        </div>
+                        <div class="timing-row">
+                            <span class="timing-label">Estimated Completion:</span>
+                            <span class="timing-value">{end_time_str}</span>
+                        </div>
+                        
+                        <div style="margin-top: 10px; font-size: 12px; color: #888; text-align: right;">
+                            <span id="refresh-counter">Auto-refreshing in 10s</span>
+                        </div>
+                        """
+                        
+                        # Add the detailed timing section
+                        timing_html += detailed_timing_html
+                        
+                        # Close the main timing box
+                        timing_html += """</div>"""
+                        
+                        # JavaScript code (no f-string to avoid conflicts with JavaScript curly braces)
+                        js_code = """
+                        <script>
+                            document.addEventListener("DOMContentLoaded", function() {
+                                var count = 10;
+                                var counter = document.getElementById("refresh-counter");
+                                if (counter) {
+                                    var timer = setInterval(function() {
+                                        count = count - 1;
+                                        if (count <= 0) {
+                                            clearInterval(timer);
+                                            counter.innerHTML = "Refreshing...";
+                                            window.location.reload();
+                                            return;
+                                        }
+                                        counter.innerHTML = "Auto-refreshing in " + count + "s";
+                                    }, 1000);
+                                }
+                            });
+                        </script>
+                        """
+                        
+                        # Combine HTML and JavaScript
+                        st.markdown(timing_html + js_code, unsafe_allow_html=True)
+                        
+                        # Display statistics
+                        st.markdown("---")
+                        st.markdown("### Real-time Statistics")
+                        
+                        # Check if there are any results to display
+                        if 'results' in task and task['results']:
+                            # Find the best result so far
+                            best_return = -float('inf')
+                            best_parameters = None
+                            total_combinations_tested = 0
+                            
+                            for batch_result in task['results']:
+                                if 'results' in batch_result and batch_result['results']:
+                                    total_combinations_tested += len(batch_result['results'])
+                                    
+                                    # Find the best result in each batch
+                                    for result in batch_result['results']:
+                                        return_pct = result['metrics'].get('return_pct', 0)
+                                        if return_pct > best_return:
+                                            best_return = return_pct
+                                            best_parameters = result['parameters']
+                            
+                            # Display combinations tested
+                            st.markdown(f"**Total combinations tested:** {total_combinations_tested}")
+                            
+                            # Display current batch combinations
+                            current_batch_index = progress.get('current_batch', 0)
+                            if current_batch_index < len(task['batches']):
+                                current_batch = task['batches'][current_batch_index]
+                                # Estimate total combinations in current batch
+                                total_params_in_current = 1
+                                for param, values in current_batch.get('optimize', {}).items():
+                                    total_params_in_current *= len(values) if isinstance(values, list) else 1
+                                
+                                st.markdown(f"**Current batch size:** {total_params_in_current} combinations")
+                            
+                            # Display best result so far
+                            if best_parameters:
+                                st.markdown("#### Best Result So Far")
+                                st.markdown(f"**Return:** {best_return:.2f}%")
+                                
+                                # Format key parameters nicely
+                                key_params = {k: v for k, v in best_parameters.items() 
+                                            if k in ['investment_pct', 'price_drop_threshold', 
+                                                   'profit_threshold', 'stop_loss_fixed_pct', 
+                                                   'trailing_stop_pct', 'number_of_bots']}
+                                
+                                # Create a clean parameter display
+                                st.markdown("**Best parameters:**")
+                                for param, value in key_params.items():
+                                    st.markdown(f"- **{param}:** {value}")
+                        else:
+                            st.info("No results available yet. Optimization in progress...")
+                        
+                        # Show a spinner for the active calculation
+                        with st.spinner("Testing parameter combinations..."):
+                            st.empty()
+                    else:
+                        # Non-animated version for completed or error states
+                        # Calculate accurate progress for completed tasks
+                        current_batch = progress.get('current_batch', 0)
+                        batch_progress = progress.get('batch_progress', 0)
+                        total_batches = len(task.get('batches', []))
+                        
+                        # Fixed progress calculation for completed/error tasks
+                        if current_batch >= total_batches:
+                            overall_progress = 1.0
+                        else:
+                            overall_progress = (current_batch + batch_progress) / total_batches
+                            
+                        # Ensure progress is between 0 and 1
+                        overall_progress = max(0.0, min(1.0, overall_progress))
+                        progress_pct = int(overall_progress * 100)
+                        
+                        st.markdown(f"**Overall Progress: {progress_pct}%**")
+                        st.progress(overall_progress)
+                        
+                        # Show more details about the current batch
+                        current_batch = progress.get('current_batch', 0)
+                        total_batches = len(task.get('batches', []))
+                        # Make sure batch number doesn't exceed total batches
+                        display_batch = min(current_batch + 1, total_batches)
+                        
+                        # Batch info in a highlighted box
+                        st.markdown(f"""
+                        <div style="padding: 10px; border-radius: 5px; background-color: #f0f2f6;">
+                            <b>Current Batch:</b> {display_batch} of {total_batches} completed
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # Add cancel button
+                    if st.button(f"Cancel Task {task_id[:8]}", key=f"cancel_{task_id}"):
+                        cancel_optimization_task(task_id)
+                        st.rerun()
+                        
+                    # Separator
+                    st.markdown("---")
+        else:
+            st.info("No optimization tasks currently running.")
+            
+            # Add a button to refresh the page
+            if st.button("Check for Running Tasks"):
+                st.rerun()
+    
+    with tab3:
+        st.header("Completed Optimizations")
+        
+        # Display completed tasks
+        if st.session_state.completed_tasks:
+            for task in st.session_state.completed_tasks:
+                task_id = task['id']
+                progress = st.session_state.optimization_progress.get(task_id, {})
+                
+                # Task container
+                with st.expander(f"Task {task_id[:8]} - {progress.get('status', '').title()} ({task['start_time'].strftime('%Y-%m-%d %H:%M')})"):
+                    # Task details with timing information
+                    status = progress.get('status', '').title()
+                    st.write(f"**Status:** {status}")
+                    
+                    # Time information
+                    start_time = task['start_time']
+                    end_time = progress.get('end_time', datetime.now())
+                    elapsed_time = (end_time - start_time).total_seconds()
+                    
+                    # Format elapsed time nicely
+                    elapsed_hours = int(elapsed_time // 3600)
+                    elapsed_minutes = int((elapsed_time % 3600) // 60)
+                    elapsed_seconds = int(elapsed_time % 60)
+                    
+                    if elapsed_hours > 0:
+                        elapsed_str = f"{elapsed_hours}h {elapsed_minutes}m {elapsed_seconds}s"
+                    else:
+                        elapsed_str = f"{elapsed_minutes}m {elapsed_seconds}s"
+                    
+                    # Create a nice timing display
+                    st.markdown(f"""
+                    <div style="background-color: #f0f7ff; border-left: 4px solid #0068c9; padding: 10px; border-radius: 5px; margin: 10px 0;">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                            <span style="font-weight: bold;">Started:</span>
+                            <span>{start_time.strftime('%Y-%m-%d %H:%M:%S')}</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                            <span style="font-weight: bold;">Finished:</span>
+                            <span>{end_time.strftime('%Y-%m-%d %H:%M:%S')}</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                            <span style="font-weight: bold;">Total Duration:</span>
+                            <span style="font-weight: bold; color: #0068c9;">{elapsed_str} ({int(elapsed_time // 60)} minutes)</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Error message if applicable
+                    if progress.get('status') == 'error':
+                        st.error(f"Error: {progress.get('error', 'Unknown error')}")
+                    
+                    # Results summary
+                    results = progress.get('results', [])
+                    
+                    if results:
+                        st.markdown("#### Results Summary")
+                        
+                        # Create results table
+                        results_data = []
+                        for result in results:
+                            batch = result['batch']
+                            best_result = result.get('best_result')
+                            
+                            if best_result:
+                                row = {
+                                    'Batch': batch['name'],
+                                    'Return (%)': f"{best_result['metrics']['return_pct']:.2f}",
+                                    'Max DD (%)': f"{best_result['metrics']['max_drawdown_pct']:.2f}",
+                                    'Win Rate (%)': f"{best_result['metrics']['win_rate']:.2f}",
+                                    'Sharpe': f"{best_result['metrics']['sharpe_ratio']:.2f}",
+                                    'Trades': best_result['metrics']['trades_count']
+                                }
+                                
+                                # Add key parameter values
+                                for param, value in best_result['parameters'].items():
+                                    if param in ['investment_pct', 'price_drop_threshold', 'profit_threshold', 
+                                               'number_of_bots', 'stop_loss_fixed_pct', 'trailing_stop_pct']:
+                                        row[param] = value
+                                
+                                results_data.append(row)
+                        
+                        # Display results table
+                        if results_data:
+                            results_df = pd.DataFrame(results_data)
+                            st.dataframe(results_df)
+                            
+                            # Get best overall result
+                            best_result = None
+                            best_return = -float('inf')
+                            
+                            for result in results:
+                                if result.get('best_result'):
+                                    current_return = result['best_result']['metrics']['return_pct']
+                                    if current_return > best_return:
+                                        best_return = current_return
+                                        best_result = result['best_result']
+                            
+                            if best_result:
+                                # Display detailed optimization info
+                                st.markdown("#### Optimization Details")
+                                
+                                # Extract data range and timeframe from task
+                                data_info = task.get('data_info', {})
+                                start_date = data_info.get('start_date', 'Unknown')
+                                end_date = data_info.get('end_date', 'Unknown')
+                                timeframe = data_info.get('timeframe', 'Unknown')
+                                exchange = data_info.get('exchange', 'Unknown')
+                                
+                                # Calculate date range duration
+                                try:
+                                    if isinstance(start_date, str) and isinstance(end_date, str):
+                                        start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+                                        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+                                        days_duration = (end_dt - start_dt).days
+                                    else:
+                                        days_duration = "Unknown"
+                                except:
+                                    days_duration = "Unknown"
+                                
+                                # Show detailed data information
+                                st.markdown("""
+                                <style>
+                                .info-box {
+                                    background-color: #f5f7fa;
+                                    border-left: 4px solid #4c8bf5;
+                                    padding: 15px;
+                                    border-radius: 5px;
+                                    margin: 15px 0;
+                                }
+                                .info-title {
+                                    font-weight: bold;
+                                    font-size: 16px;
+                                    margin-bottom: 10px;
+                                    color: #333;
+                                }
+                                .info-row {
+                                    display: flex;
+                                    justify-content: space-between;
+                                    margin-bottom: 8px;
+                                }
+                                .info-label {
+                                    font-weight: bold;
+                                    color: #555;
+                                }
+                                .info-value {
+                                    color: #4c8bf5;
+                                }
+                                </style>
+                                """, unsafe_allow_html=True)
+                                
+                                st.markdown(f"""
+                                <div class="info-box">
+                                    <div class="info-title">📈 Optimization Data Details</div>
+                                    <div class="info-row">
+                                        <span class="info-label">Date Range:</span>
+                                        <span class="info-value">{start_date} to {end_date}</span>
+                                    </div>
+                                    <div class="info-row">
+                                        <span class="info-label">Duration:</span>
+                                        <span class="info-value">{days_duration} days</span>
+                                    </div>
+                                    <div class="info-row">
+                                        <span class="info-label">Timeframe:</span>
+                                        <span class="info-value">{timeframe}</span>
+                                    </div>
+                                    <div class="info-row">
+                                        <span class="info-label">Exchange:</span>
+                                        <span class="info-value">{exchange}</span>
+                                    </div>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                # Get buy-and-hold comparison if available
+                                if best_result and 'metrics' in best_result:
+                                    buy_hold_return = best_result['metrics'].get('buy_hold_return_pct', 'Not calculated')
+                                    if buy_hold_return != 'Not calculated':
+                                        outperformance = best_return - buy_hold_return
+                                        st.markdown(f"""
+                                        <div class="info-box" style="border-left-color: #34a853;">
+                                            <div class="info-title">🔄 Strategy vs Buy & Hold</div>
+                                            <div class="info-row">
+                                                <span class="info-label">Strategy Return:</span>
+                                                <span class="info-value">{best_return:.2f}%</span>
+                                            </div>
+                                            <div class="info-row">
+                                                <span class="info-label">Buy & Hold Return:</span>
+                                                <span class="info-value">{buy_hold_return:.2f}%</span>
+                                            </div>
+                                            <div class="info-row">
+                                                <span class="info-label">Outperformance:</span>
+                                                <span class="info-value" style="color: {'#34a853' if outperformance > 0 else '#ea4335'}">
+                                                    {outperformance:.2f}%
+                                                </span>
+                                            </div>
+                                        </div>
+                                        """, unsafe_allow_html=True)
+                                
+                                # Display best parameters
+                                st.markdown("#### Best Overall Parameters")
+                                
+                                # Format parameters
+                                param_text = ", ".join([f"{k}={v}" for k, v in best_result['parameters'].items() 
+                                                     if k in ['investment_pct', 'price_drop_threshold', 
+                                                              'profit_threshold', 'stop_loss_fixed_pct', 
+                                                              'trailing_stop_pct', 'number_of_bots',
+                                                              'max_position_duration']])
+                                
+                                st.info(f"Best performance: **{best_return:.2f}%** with parameters: {param_text}")
+                                
+                                # Code snippet for copy-paste
+                                param_code = "{\n"
+                                for k, v in best_result['parameters'].items():
+                                    if isinstance(v, bool):
+                                        v_str = str(v).lower()
+                                    else:
+                                        v_str = str(v)
+                                    param_code += f"    '{k}': {v_str},\n"
+                                param_code += "}"
+                                
+                                st.code(param_code, language="python")
+                            
+                            # View in optimization analysis tool
+                            if st.button(f"Analyze Results (Task {task_id[:8]})"):
+                                # Store the task ID in session state for the optimization analysis page
+                                st.session_state.selected_optimization_task = task_id
+                                # Create a string with the task parameters to pass as query parameters
+                                task_params = f"task_id={task_id}"
+                                # Redirect to the optimization analysis page with the task ID
+                                st.markdown(f"""
+                                <meta http-equiv="refresh" content="0;url=/optimization_analysis?{task_params}">
+                                <script>window.location.href = "/optimization_analysis?{task_params}";</script>
+                                """, unsafe_allow_html=True)
+                                st.info("Redirecting to Optimization Analysis tool...")
+                    else:
+                        st.warning("No results found for this task.")
+        else:
+            st.info("No completed optimization tasks found.")
+
+if __name__ == "__main__":
+    main()

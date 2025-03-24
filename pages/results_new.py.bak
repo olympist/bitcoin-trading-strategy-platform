@@ -1,0 +1,963 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import os
+import sys
+import time
+from datetime import datetime, date
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+import plotly.express as px
+from typing import Dict, List, Optional, Tuple, Union
+
+# Ensure we can import from parent directory
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import project modules
+from utils.results_manager import ResultsManager
+from visualization import PerformancePlots
+
+st.set_page_config(
+    page_title="Results Comparison - Bitcoin Backtesting Platform",
+    page_icon="📊",
+    layout="wide"
+)
+
+# Initialize session state variables if they don't exist
+if 'saved_backtests' not in st.session_state:
+    st.session_state.saved_backtests = []
+if 'saved_results' not in st.session_state:
+    st.session_state.saved_results = []
+
+# Load custom CSS
+st.markdown("""
+<style>
+    .section-header {
+        font-size: 1.5rem;
+        color: #f7931a;
+        font-weight: bold;
+        margin-bottom: 1rem;
+    }
+    .info-box {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin-bottom: 1rem;
+    }
+    .stButton button {
+        background-color: #f7931a;
+        color: white;
+    }
+    .metric-container {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        text-align: center;
+    }
+    .metric-value {
+        font-size: 1.5rem;
+        font-weight: bold;
+    }
+    .metric-label {
+        font-size: 0.8rem;
+        color: gray;
+    }
+    .result-card {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin-bottom: 1rem;
+        border-left: 4px solid #f7931a;
+    }
+    .comparison-table {
+        margin-top: 1rem;
+        margin-bottom: 1rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Page header
+st.markdown('<p class="section-header">Results Comparison</p>', unsafe_allow_html=True)
+st.markdown("Compare and analyze results from different backtests and simulations.")
+
+# Initialize results manager and load results from disk
+results_manager = ResultsManager()
+
+# Get results from disk and session state
+backtest_results_from_disk = []
+optimization_results_from_disk = []
+
+# Get backtest results from disk
+try:
+    backtest_results_list = results_manager.list_backtest_results(limit=50)
+    for result_meta in backtest_results_list:
+        if 'filepath' in result_meta:
+            # Load the full result
+            result = results_manager.load_backtest_results(result_meta['filepath'])
+            # Add to session state if loading was successful
+            if result and isinstance(result, dict):
+                # Format as a result item compatible with current UI
+                formatted_result = {
+                    'name': f"{result_meta.get('strategy_name', 'Unknown Strategy')} ({result_meta.get('timestamp', '')})",
+                    'timestamp': result_meta.get('timestamp', datetime.now().strftime("%Y%m%d_%H%M%S")),
+                    'parameters': result_meta.get('parameters', {}),
+                    'results': result,
+                    'type': 'backtest',
+                    'data_file': result_meta.get('data_file', 'Unknown'),
+                    'filepath': result_meta.get('filepath')
+                }
+                backtest_results_from_disk.append(formatted_result)
+except Exception as e:
+    st.warning(f"Error loading backtest results from disk: {str(e)}")
+
+# Get optimization results from disk
+try:
+    optimization_results_list = results_manager.list_optimization_results(limit=50)
+    for result_meta in optimization_results_list:
+        if 'filepath' in result_meta:
+            # Format as a result item compatible with current UI
+            formatted_result = {
+                'name': f"Optimization: {result_meta.get('strategy_name', 'Unknown Strategy')} ({result_meta.get('timestamp', '')})",
+                'timestamp': result_meta.get('timestamp', datetime.now().strftime("%Y%m%d_%H%M%S")),
+                'parameters': result_meta.get('parameter_ranges', {}),
+                'results': result_meta.get('top_results', []),
+                'type': 'optimization',
+                'data_file': result_meta.get('data_file', 'Unknown'),
+                'filepath': result_meta.get('filepath')
+            }
+            optimization_results_from_disk.append(formatted_result)
+except Exception as e:
+    st.warning(f"Error loading optimization results from disk: {str(e)}")
+
+# Combine saved backtests and simulations from session state and disk
+session_state_results = st.session_state.saved_backtests + st.session_state.saved_results
+all_saved_results = session_state_results + backtest_results_from_disk + optimization_results_from_disk
+
+if not all_saved_results:
+    st.info("No saved results found. Run a backtest or Monte Carlo simulation and save the results to compare them here.")
+else:
+    # Create tabs for different comparison views
+    tab1, tab2, tab3, tab4 = st.tabs(["Results Overview", "Summary Analysis", "Detailed Comparison", "Export Results"])
+    
+    # Tab 1: Results Overview
+    with tab1:
+        st.markdown("### Saved Results")
+        
+        # Display cards for each saved result
+        for i, result in enumerate(all_saved_results):
+            with st.container():
+                st.markdown(f"<div class='result-card'>", unsafe_allow_html=True)
+                
+                # Determine result type
+                result_type = result.get('type', 'backtest')  # Default to backtest if not specified
+                
+                # Create a header row with name and timestamp
+                col1, col2, col3 = st.columns([3, 2, 1])
+                
+                with col1:
+                    st.markdown(f"#### {result['name']}")
+                    st.markdown(f"**Type:** {'Monte Carlo Simulation' if result_type == 'monte_carlo' else 'Backtest'}")
+                
+                with col2:
+                    timestamp = result['timestamp']
+                    if isinstance(timestamp, datetime):
+                        timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        timestamp_str = str(timestamp)
+                    
+                    st.markdown(f"**Date:** {timestamp_str}")
+                    st.markdown(f"**Data:** {result.get('data_file', 'Unknown')}")
+                
+                with col3:
+                    # Add delete button (only for session state results)
+                    if 'filepath' not in result:
+                        if st.button("Delete", key=f"delete_{i}"):
+                            # Only remove from session state
+                            if result in st.session_state.saved_backtests:
+                                st.session_state.saved_backtests.remove(result)
+                            elif result in st.session_state.saved_results:
+                                st.session_state.saved_results.remove(result)
+                            st.experimental_rerun()
+                    else:
+                        st.info("Disk Saved")
+                
+                # Display parameters
+                st.markdown("##### Parameters:")
+                
+                params = result['parameters']
+                col1, col2, col3, col4 = st.columns(4)
+                
+                # Show parameters if they exist
+                if params:
+                    with col1:
+                        if 'initial_capital' in params:
+                            st.markdown(f"**Initial Capital:** ${params['initial_capital']:.2f}")
+                        else:
+                            st.markdown("**Initial Capital:** N/A")
+                    
+                    with col2:
+                        if 'investment_pct' in params:
+                            st.markdown(f"**Investment (%):** {params['investment_pct']:.1f}%")
+                        else:
+                            st.markdown("**Investment (%):** N/A")
+                    
+                    with col3:
+                        if 'price_drop_threshold' in params:
+                            st.markdown(f"**Drop Threshold (%):** {params['price_drop_threshold']:.1f}%")
+                        else:
+                            st.markdown("**Drop Threshold (%):** N/A")
+                    
+                    with col4:
+                        if 'profit_threshold' in params:
+                            st.markdown(f"**Profit Threshold (%):** {params['profit_threshold']:.1f}%")
+                        else:
+                            st.markdown("**Profit Threshold (%):** N/A")
+                else:
+                    st.markdown("No parameters available")
+                
+                # Display results summary based on type
+                st.markdown("##### Results Summary:")
+                
+                if result_type == 'monte_carlo':
+                    # Monte Carlo specific summary
+                    summary = result['summary']
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric(
+                            "Mean Return",
+                            f"{summary['return_pct']['mean']:.2f}%"
+                        )
+                    
+                    with col2:
+                        st.metric(
+                            "Median Return",
+                            f"{summary['return_pct']['median']:.2f}%"
+                        )
+                    
+                    with col3:
+                        st.metric(
+                            "Probability of Profit",
+                            f"{summary['probability_of_profit']:.1f}%"
+                        )
+                    
+                    with col4:
+                        st.metric(
+                            "Mean Max Drawdown",
+                            f"{summary['max_drawdown_pct']['mean']:.2f}%"
+                        )
+                elif result_type == 'optimization':
+                    # Optimization specific summary
+                    top_results = result['results']
+                    if top_results and len(top_results) > 0:
+                        top_result = top_results[0]  # Get the best result
+                        
+                        col1, col2, col3, col4 = st.columns(4)
+                        
+                        with col1:
+                            metric_name = "Best Return"
+                            metric_value = top_result.get('return_pct', 0)
+                            st.metric(
+                                metric_name,
+                                f"{metric_value:.2f}%"
+                            )
+                        
+                        with col2:
+                            st.markdown(f"**Best Parameters:**")
+                            # Get the key parameters
+                            param_str = ""
+                            for key, value in top_result.get('parameters', {}).items():
+                                if key not in ['strategy_type', 'initial_capital', 'trading_fee_pct']:
+                                    param_str += f"{key}: {value}, "
+                            st.markdown(param_str[:-2] if param_str else "N/A")
+                        
+                        with col3:
+                            st.metric(
+                                "Tests Run",
+                                f"{len(result.get('all_results', [])) if 'all_results' in result else len(top_results)}"
+                            )
+                        
+                        with col4:
+                            st.metric(
+                                "Best Max Drawdown",
+                                f"{top_result.get('max_drawdown_pct', 0):.2f}%"
+                            )
+                    else:
+                        st.warning("No optimization results available")
+                else:
+                    # Regular backtest summary
+                    if isinstance(result['results'], dict):
+                        backtest_results = result['results']
+                        
+                        col1, col2, col3, col4 = st.columns(4)
+                        
+                        with col1:
+                            if 'return_pct' in backtest_results and 'buy_hold_return_pct' in backtest_results:
+                                st.metric(
+                                    "Return",
+                                    f"{backtest_results['return_pct']:.2f}%",
+                                    f"{backtest_results.get('outperformance', backtest_results['return_pct'] - backtest_results['buy_hold_return_pct']):.2f}% vs B&H"
+                                )
+                            elif 'return_pct' in backtest_results:
+                                st.metric("Return", f"{backtest_results['return_pct']:.2f}%")
+                            else:
+                                st.metric("Return", "N/A")
+                        
+                        with col2:
+                            if 'max_drawdown_pct' in backtest_results:
+                                st.metric("Max Drawdown", f"{backtest_results['max_drawdown_pct']:.2f}%")
+                            else:
+                                st.metric("Max Drawdown", "N/A")
+                        
+                        with col3:
+                            if 'final_equity' in backtest_results:
+                                st.metric("Final Equity", f"${backtest_results['final_equity']:.2f}")
+                            else:
+                                st.metric("Final Equity", "N/A")
+                        
+                        with col4:
+                            if 'trades_count' in backtest_results:
+                                st.metric("Trades", f"{backtest_results['trades_count']}")
+                            else:
+                                st.metric("Trades", "N/A")
+                    else:
+                        st.warning("Results data is not in expected format")
+                
+                # Add selection checkbox
+                selected = st.checkbox("Select for comparison", key=f"select_{i}")
+                
+                # Store selection in session state
+                if f"selected_{i}" not in st.session_state:
+                    st.session_state[f"selected_{i}"] = False
+                
+                st.session_state[f"selected_{i}"] = selected
+                
+                st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Get selected results for comparison
+        selected_indices = [i for i in range(len(all_saved_results)) if st.session_state.get(f"selected_{i}", False)]
+        selected_results = [all_saved_results[i] for i in selected_indices]
+        
+        # Display comparison if multiple results are selected
+        if len(selected_results) > 1:
+            st.markdown("### Quick Comparison")
+            
+            # Create comparison table
+            comparison_data = []
+            
+            for result in selected_results:
+                result_type = result.get('type', 'backtest')
+                
+                if result_type == 'monte_carlo':
+                    # Monte Carlo entry
+                    summary = result['summary']
+                    row = {
+                        'Name': result['name'],
+                        'Type': 'Monte Carlo',
+                        'Parameters': f"Inv: {result['parameters'].get('investment_pct', 'N/A')}%, Drop: {result['parameters'].get('price_drop_threshold', 'N/A')}%, Profit: {result['parameters'].get('profit_threshold', 'N/A')}%",
+                        'Return': f"{summary['return_pct']['mean']:.2f}% (mean)",
+                        'Max Drawdown': f"{summary['max_drawdown_pct']['mean']:.2f}% (mean)",
+                        'Profit Probability': f"{summary['probability_of_profit']:.1f}%",
+                        'Trades': f"{summary['trades_count']['mean']:.1f} (mean)",
+                        'Simulations': result['parameters'].get('num_simulations', 'N/A')
+                    }
+                elif result_type == 'optimization':
+                    # Optimization entry
+                    top_results = result['results']
+                    if top_results and len(top_results) > 0:
+                        top_result = top_results[0]
+                        row = {
+                            'Name': result['name'],
+                            'Type': 'Optimization',
+                            'Parameters': 'Multiple parameter sets',
+                            'Return': f"{top_result.get('return_pct', 0):.2f}% (best)",
+                            'Max Drawdown': f"{top_result.get('max_drawdown_pct', 0):.2f}%",
+                            'Profit Probability': 'N/A',
+                            'Trades': f"{top_result.get('trades_count', 0)}",
+                            'Simulations': f"{len(result.get('all_results', [])) if 'all_results' in result else len(top_results)}"
+                        }
+                    else:
+                        # Skip if no results
+                        continue
+                else:
+                    # Regular backtest entry
+                    if isinstance(result['results'], dict):
+                        backtest_results = result['results']
+                        row = {
+                            'Name': result['name'],
+                            'Type': 'Backtest',
+                            'Parameters': f"Inv: {result['parameters'].get('investment_pct', 'N/A')}%, Drop: {result['parameters'].get('price_drop_threshold', 'N/A')}%, Profit: {result['parameters'].get('profit_threshold', 'N/A')}%",
+                            'Return': f"{backtest_results.get('return_pct', 0):.2f}%",
+                            'Max Drawdown': f"{backtest_results.get('max_drawdown_pct', 0):.2f}%",
+                            'Profit Probability': 'N/A',
+                            'Trades': f"{backtest_results.get('trades_count', 0)}",
+                            'Simulations': 'N/A'
+                        }
+                    else:
+                        # Skip if not a valid result
+                        continue
+                
+                comparison_data.append(row)
+            
+            # Create comparison dataframe
+            comparison_df = pd.DataFrame(comparison_data)
+            
+            # Display comparison table
+            st.markdown('<div class="comparison-table">', unsafe_allow_html=True)
+            st.table(comparison_df)
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Create comparison chart
+            st.markdown("#### Return Comparison")
+            
+            fig = go.Figure()
+            
+            for result in selected_results:
+                result_type = result.get('type', 'backtest')
+                
+                if result_type == 'monte_carlo':
+                    # Monte Carlo visualization
+                    summary = result['summary']
+                    
+                    fig.add_trace(go.Box(
+                        y=[result['summary']['return_pct']['min'], 
+                           result['summary']['return_pct']['percentiles']['5%'], 
+                           result['summary']['return_pct']['percentiles']['25%'], 
+                           result['summary']['return_pct']['median'], 
+                           result['summary']['return_pct']['percentiles']['75%'], 
+                           result['summary']['return_pct']['percentiles']['95%'], 
+                           result['summary']['return_pct']['max']],
+                        name=result['name'],
+                        boxpoints=False,
+                        marker_color=f"rgba({hash(result['name']) % 256}, {(hash(result['name']) // 256) % 256}, {(hash(result['name']) // 65536) % 256}, 0.7)"
+                    ))
+                elif result_type == 'optimization':
+                    # Optimization visualization
+                    top_results = result['results']
+                    if top_results and len(top_results) > 0:
+                        # Get the top result
+                        top_result = top_results[0]
+                        fig.add_trace(go.Bar(
+                            y=[top_result.get('return_pct', 0)],
+                            name=f"{result['name']} (Best)",
+                            marker_color=f"rgba({hash(result['name']) % 256}, {(hash(result['name']) // 256) % 256}, {(hash(result['name']) // 65536) % 256}, 0.7)"
+                        ))
+                else:
+                    # Regular backtest visualization
+                    if isinstance(result['results'], dict):
+                        backtest_results = result['results']
+                        if 'return_pct' in backtest_results:
+                            fig.add_trace(go.Bar(
+                                y=[backtest_results['return_pct']],
+                                name=result['name'],
+                                marker_color=f"rgba({hash(result['name']) % 256}, {(hash(result['name']) // 256) % 256}, {(hash(result['name']) // 65536) % 256}, 0.7)"
+                            ))
+            
+            fig.update_layout(
+                title='Return Comparison',
+                yaxis_title='Return (%)',
+                template='plotly_white',
+                boxmode='group',
+                margin=dict(l=0, r=0, t=40, b=0)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+    
+    # Tab 2: Detailed Comparison
+    with tab2:
+        st.markdown("### Detailed Results Comparison")
+        
+        # Get selected results for comparison
+        selected_indices = [i for i in range(len(all_saved_results)) if st.session_state.get(f"selected_{i}", False)]
+        selected_results = [all_saved_results[i] for i in selected_indices]
+        
+        if len(selected_results) < 2:
+            st.info("Please select at least two results for detailed comparison.")
+        else:
+            # Create comparison tabs
+            comp_tab1, comp_tab2, comp_tab3 = st.tabs(["Return Analysis", "Risk Metrics", "Parameter Impact"])
+            
+            # Tab 1: Return Analysis
+            with comp_tab1:
+                st.markdown("#### Return Metrics Comparison")
+                
+                # Create return metrics table
+                return_data = []
+                
+                for result in selected_results:
+                    result_type = result.get('type', 'backtest')
+                    
+                    if result_type == 'monte_carlo':
+                        # Monte Carlo return metrics
+                        summary = result['summary']
+                        row = {
+                            'Name': result['name'],
+                            'Type': 'Monte Carlo',
+                            'Mean Return (%)': f"{summary['return_pct']['mean']:.2f}",
+                            'Median Return (%)': f"{summary['return_pct']['median']:.2f}",
+                            'Return Std Dev (%)': f"{summary['return_pct']['std']:.2f}",
+                            'Min Return (%)': f"{summary['return_pct']['min']:.2f}",
+                            'Max Return (%)': f"{summary['return_pct']['max']:.2f}",
+                            '5th Percentile (%)': f"{summary['return_pct']['percentiles']['5%']:.2f}",
+                            '95th Percentile (%)': f"{summary['return_pct']['percentiles']['95%']:.2f}"
+                        }
+                    elif result_type == 'optimization':
+                        # Optimization return metrics
+                        top_results = result['results']
+                        if top_results and len(top_results) > 0:
+                            # Get the top result
+                            top_result = top_results[0]
+                            row = {
+                                'Name': result['name'],
+                                'Type': 'Optimization (Best Result)',
+                                'Mean Return (%)': f"{top_result.get('return_pct', 0):.2f}",
+                                'Median Return (%)': 'N/A',
+                                'Return Std Dev (%)': 'N/A',
+                                'Min Return (%)': 'N/A',
+                                'Max Return (%)': 'N/A',
+                                '5th Percentile (%)': 'N/A',
+                                '95th Percentile (%)': 'N/A'
+                            }
+                        else:
+                            continue
+                    else:
+                        # Regular backtest return metrics
+                        if isinstance(result['results'], dict):
+                            backtest_results = result['results']
+                            row = {
+                                'Name': result['name'],
+                                'Type': 'Backtest',
+                                'Mean Return (%)': f"{backtest_results.get('return_pct', 0):.2f}",
+                                'Median Return (%)': f"{backtest_results.get('return_pct', 0):.2f}",
+                                'Return Std Dev (%)': 'N/A',
+                                'Min Return (%)': f"{backtest_results.get('return_pct', 0):.2f}",
+                                'Max Return (%)': f"{backtest_results.get('return_pct', 0):.2f}",
+                                '5th Percentile (%)': 'N/A',
+                                '95th Percentile (%)': 'N/A'
+                            }
+                        else:
+                            continue
+                    
+                    return_data.append(row)
+                
+                # Create return metrics dataframe
+                return_df = pd.DataFrame(return_data)
+                
+                # Display return metrics table
+                st.table(return_df)
+                
+                # Compare return distribution for Monte Carlo results
+                mc_results = [r for r in selected_results if r.get('type', 'backtest') == 'monte_carlo']
+                
+                if mc_results:
+                    st.markdown("#### Return Distribution Comparison")
+                    
+                    fig = go.Figure()
+                    
+                    for result in mc_results:
+                        summary = result['summary']
+                        
+                        # Check if distribution data is available
+                        if 'return_distribution' in summary:
+                            # Create a KDE plot or histogram
+                            fig.add_trace(go.Histogram(
+                                x=summary['return_distribution'],
+                                name=result['name'],
+                                histnorm='probability density',
+                                opacity=0.7,
+                                marker_color=f"rgba({hash(result['name']) % 256}, {(hash(result['name']) // 256) % 256}, {(hash(result['name']) // 65536) % 256}, 0.7)"
+                            ))
+                    
+                    fig.update_layout(
+                        title='Return Distribution',
+                        xaxis_title='Return (%)',
+                        yaxis_title='Probability Density',
+                        template='plotly_white',
+                        barmode='overlay',
+                        margin=dict(l=0, r=0, t=40, b=0)
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            # Tab 2: Risk Metrics
+            with comp_tab2:
+                st.markdown("#### Risk Metrics Comparison")
+                
+                # Create risk metrics table
+                risk_data = []
+                
+                for result in selected_results:
+                    result_type = result.get('type', 'backtest')
+                    
+                    if result_type == 'monte_carlo':
+                        # Monte Carlo risk metrics
+                        summary = result['summary']
+                        row = {
+                            'Name': result['name'],
+                            'Type': 'Monte Carlo',
+                            'Mean Max Drawdown (%)': f"{summary['max_drawdown_pct']['mean']:.2f}",
+                            'Median Max Drawdown (%)': f"{summary['max_drawdown_pct']['median']:.2f}",
+                            'Worst Max Drawdown (%)': f"{summary['max_drawdown_pct']['max']:.2f}",
+                            'Sharpe Ratio': f"{summary.get('sharpe_ratio', {}).get('mean', 'N/A')}",
+                            'Sortino Ratio': f"{summary.get('sortino_ratio', {}).get('mean', 'N/A')}",
+                            'Probability of Loss (%)': f"{100 - summary['probability_of_profit']:.1f}"
+                        }
+                    elif result_type == 'optimization':
+                        # Optimization risk metrics
+                        top_results = result['results']
+                        if top_results and len(top_results) > 0:
+                            # Get the top result
+                            top_result = top_results[0]
+                            row = {
+                                'Name': result['name'],
+                                'Type': 'Optimization (Best Result)',
+                                'Mean Max Drawdown (%)': f"{top_result.get('max_drawdown_pct', 0):.2f}",
+                                'Median Max Drawdown (%)': 'N/A',
+                                'Worst Max Drawdown (%)': f"{top_result.get('max_drawdown_pct', 0):.2f}",
+                                'Sharpe Ratio': f"{top_result.get('sharpe_ratio', 'N/A')}",
+                                'Sortino Ratio': f"{top_result.get('sortino_ratio', 'N/A')}",
+                                'Probability of Loss (%)': 'N/A'
+                            }
+                        else:
+                            continue
+                    else:
+                        # Regular backtest risk metrics
+                        if isinstance(result['results'], dict):
+                            backtest_results = result['results']
+                            row = {
+                                'Name': result['name'],
+                                'Type': 'Backtest',
+                                'Mean Max Drawdown (%)': f"{backtest_results.get('max_drawdown_pct', 0):.2f}",
+                                'Median Max Drawdown (%)': f"{backtest_results.get('max_drawdown_pct', 0):.2f}",
+                                'Worst Max Drawdown (%)': f"{backtest_results.get('max_drawdown_pct', 0):.2f}",
+                                'Sharpe Ratio': f"{backtest_results.get('sharpe_ratio', 'N/A')}",
+                                'Sortino Ratio': f"{backtest_results.get('sortino_ratio', 'N/A')}",
+                                'Probability of Loss (%)': 'N/A'
+                            }
+                        else:
+                            continue
+                    
+                    risk_data.append(row)
+                
+                # Create risk metrics dataframe
+                risk_df = pd.DataFrame(risk_data)
+                
+                # Display risk metrics table
+                st.table(risk_df)
+                
+                # Compare drawdown curves for backtest results
+                backtest_results = [r for r in selected_results if r.get('type', 'backtest') != 'monte_carlo']
+                
+                if backtest_results:
+                    st.markdown("#### Drawdown Curve Comparison")
+                    
+                    fig = go.Figure()
+                    
+                    for result in backtest_results:
+                        results_data = result['results']
+                        
+                        if 'equity_curve' in results_data:
+                            equity_curve = results_data['equity_curve']
+                            
+                            if 'drawdown_pct' in equity_curve.columns:
+                                fig.add_trace(go.Scatter(
+                                    x=equity_curve.index,
+                                    y=equity_curve['drawdown_pct'],
+                                    mode='lines',
+                                    name=result['name'],
+                                    line=dict(width=2),
+                                    opacity=0.7
+                                ))
+                    
+                    fig.update_layout(
+                        title='Drawdown Comparison',
+                        xaxis_title='Date',
+                        yaxis_title='Drawdown (%)',
+                        yaxis=dict(
+                            tickformat='.1f',
+                            autorange="reversed"  # Invert y-axis to show drawdown as negative
+                        ),
+                        template='plotly_white',
+                        margin=dict(l=0, r=0, t=40, b=0)
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            # Tab 3: Parameter Impact
+            with comp_tab3:
+                st.markdown("#### Parameter Impact Analysis")
+                
+                # Combine backtest and optimization results
+                non_mc_results = [r for r in selected_results if r.get('type', 'backtest') != 'monte_carlo']
+                
+                if non_mc_results:
+                    # Extract parameters and performance metrics
+                    param_data = []
+                    
+                    for result in non_mc_results:
+                        result_type = result.get('type', 'backtest')
+                        
+                        if result_type == 'optimization':
+                            # Extract from each optimization result
+                            for i, opt_result in enumerate(result['results']):
+                                if isinstance(opt_result, dict) and 'parameters' in opt_result:
+                                    params = opt_result['parameters']
+                                    param_data.append({
+                                        'Name': f"{result['name']} #{i+1}",
+                                        'Return (%)': opt_result.get('return_pct', 0),
+                                        'Max Drawdown (%)': opt_result.get('max_drawdown_pct', 0),
+                                        'Initial Capital': params.get('initial_capital', 0),
+                                        'Investment (%)': params.get('investment_pct', 0),
+                                        'Drop Threshold (%)': params.get('price_drop_threshold', 0),
+                                        'Profit Threshold (%)': params.get('profit_threshold', 0),
+                                        'Stop Loss (%)': params.get('stop_loss_fixed_pct', 0),
+                                        'Trailing Stop (%)': params.get('trailing_stop_pct', 0)
+                                    })
+                        else:
+                            # Regular backtest
+                            if isinstance(result['results'], dict) and 'return_pct' in result['results']:
+                                params = result['parameters']
+                                param_data.append({
+                                    'Name': result['name'],
+                                    'Return (%)': result['results'].get('return_pct', 0),
+                                    'Max Drawdown (%)': result['results'].get('max_drawdown_pct', 0),
+                                    'Initial Capital': params.get('initial_capital', 0),
+                                    'Investment (%)': params.get('investment_pct', 0),
+                                    'Drop Threshold (%)': params.get('price_drop_threshold', 0),
+                                    'Profit Threshold (%)': params.get('profit_threshold', 0),
+                                    'Stop Loss (%)': params.get('stop_loss_fixed_pct', 0),
+                                    'Trailing Stop (%)': params.get('trailing_stop_pct', 0)
+                                })
+                    
+                    if param_data:
+                        # Create parameter dataframe
+                        param_df = pd.DataFrame(param_data)
+                        
+                        # Sort by return
+                        param_df = param_df.sort_values('Return (%)', ascending=False)
+                        
+                        # Display parameter table
+                        st.dataframe(param_df)
+                        
+                        # Parameter scatter plot
+                        st.markdown("#### Parameter vs. Return")
+                        
+                        # Select parameter to analyze
+                        param_options = [col for col in param_df.columns if col not in ['Name', 'Return (%)', 'Max Drawdown (%)']]
+                        param_to_analyze = st.selectbox(
+                            "Select parameter to analyze",
+                            options=param_options,
+                            index=0
+                        )
+                        
+                        # Create scatter plot
+                        fig = go.Figure()
+                        
+                        fig.add_trace(go.Scatter(
+                            x=param_df[param_to_analyze],
+                            y=param_df['Return (%)'],
+                            mode='markers',
+                            marker=dict(
+                                size=10,
+                                color=param_df['Max Drawdown (%)'],
+                                colorscale='Viridis',
+                                colorbar=dict(title="Max Drawdown (%)"),
+                                opacity=0.8
+                            ),
+                            text=param_df['Name'],
+                            hovertemplate=
+                            '<b>%{text}</b><br>' +
+                            f'{param_to_analyze}: %{{x}}<br>' +
+                            'Return: %{y:.2f}%<br>' +
+                            'Max Drawdown: %{marker.color:.2f}%<br>' +
+                            '<extra></extra>'
+                        ))
+                        
+                        fig.update_layout(
+                            title=f'Return vs. {param_to_analyze}',
+                            xaxis_title=param_to_analyze,
+                            yaxis_title='Return (%)',
+                            template='plotly_white',
+                            margin=dict(l=0, r=0, t=40, b=0)
+                        )
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No backtest or optimization results available for parameter analysis.")
+    
+    # Tab 3: Export Results
+    with tab3:
+        st.markdown("### Export Results")
+        
+        # Get selected results for export
+        selected_indices = [i for i in range(len(all_saved_results)) if st.session_state.get(f"selected_{i}", False)]
+        selected_results = [all_saved_results[i] for i in selected_indices]
+        
+        if not selected_results:
+            st.info("Please select at least one result to export.")
+        else:
+            # Create two columns for different operations
+            export_col, save_col = st.columns(2)
+            
+            # Export options in the first column
+            with export_col:
+                st.markdown("#### Export to File")
+                
+                export_format = st.radio(
+                    "Choose export format",
+                    ["CSV", "JSON"],
+                    index=0
+                )
+                
+                if export_format == "CSV":
+                    # Create CSV export data
+                    csv_data = []
+                    
+                    # Create header row
+                    header = ["Name", "Type", "Date", "Initial Capital", "Return (%)", "Max Drawdown (%)", "Win Rate (%)", "Trades Count"]
+                    csv_data.append(",".join(header))
+                    
+                    # Add data rows
+                    for result in selected_results:
+                        result_type = result.get('type', 'backtest')
+                        
+                        if result_type == 'monte_carlo':
+                            # Monte Carlo row
+                            summary = result['summary']
+                            row = [
+                                result['name'].replace(",", " "),
+                                "Monte Carlo",
+                                str(result['timestamp']),
+                                str(result['parameters'].get('initial_capital', 'N/A')),
+                                f"{summary['return_pct']['mean']:.2f}",
+                                f"{summary['max_drawdown_pct']['mean']:.2f}",
+                                f"{summary['win_rate']['mean']:.2f}" if 'win_rate' in summary else "N/A",
+                                f"{summary['trades_count']['mean']:.1f}"
+                            ]
+                        elif result_type == 'optimization':
+                            # Optimization row (best result)
+                            top_results = result['results']
+                            if top_results and len(top_results) > 0:
+                                top_result = top_results[0]
+                                row = [
+                                    result['name'].replace(",", " "),
+                                    "Optimization",
+                                    str(result['timestamp']),
+                                    str(result['parameters'].get('initial_capital', 'N/A')),
+                                    f"{top_result.get('return_pct', 0):.2f}",
+                                    f"{top_result.get('max_drawdown_pct', 0):.2f}",
+                                    f"{top_result.get('win_rate', 0):.2f}",
+                                    str(top_result.get('trades_count', 0))
+                                ]
+                            else:
+                                continue
+                        else:
+                            # Regular backtest row
+                            if isinstance(result['results'], dict):
+                                backtest_results = result['results']
+                                row = [
+                                    result['name'].replace(",", " "),
+                                    "Backtest",
+                                    str(result['timestamp']),
+                                    str(result['parameters'].get('initial_capital', 'N/A')),
+                                    f"{backtest_results.get('return_pct', 0):.2f}",
+                                    f"{backtest_results.get('max_drawdown_pct', 0):.2f}",
+                                    f"{backtest_results.get('win_rate', 0):.2f}",
+                                    str(backtest_results.get('trades_count', 0))
+                                ]
+                            else:
+                                continue
+                        
+                        csv_data.append(",".join(row))
+                    
+                    # Combine rows to CSV string
+                    csv_data = "\n".join(csv_data)
+                    
+                    # Download button
+                    st.download_button(
+                        label="Download CSV",
+                        data=csv_data,
+                        file_name=f"bitcoin_strategy_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    # Create JSON export data
+                    import json
+                    
+                    # Convert datetime objects to strings
+                    def datetime_handler(x):
+                        if isinstance(x, datetime):
+                            return x.isoformat()
+                        raise TypeError(f"Object of type {type(x)} is not JSON serializable")
+                    
+                    # Convert to JSON
+                    json_data = json.dumps(selected_results, default=datetime_handler, indent=2)
+                    
+                    # Download button
+                    st.download_button(
+                        label="Download JSON",
+                        data=json_data,
+                        file_name=f"bitcoin_strategy_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        mime="application/json"
+                    )
+            
+            # Save to disk options in the second column
+            with save_col:
+                st.markdown("#### Save to Disk (Permanent Storage)")
+                
+                # Option to save selected results to disk
+                st.info("Save selected results to disk for permanent storage. This allows you to access them even after restarting the application.")
+                
+                # Only show save button for backtest results (not Monte Carlo yet)
+                backtest_results = [r for r in selected_results if r.get('type', 'backtest') == 'backtest']
+                
+                if not backtest_results:
+                    st.warning("Only backtest results can be saved to disk permanently. Monte Carlo and optimization results are not yet supported.")
+                else:
+                    if st.button("Save Selected Results to Disk", key="save_to_disk"):
+                        saved_count = 0
+                        for result in backtest_results:
+                            if 'results' in result and isinstance(result['results'], dict):
+                                # Check if it's a complete result or just a summary
+                                if 'equity_curve' in result['results'] and isinstance(result['results']['equity_curve'], pd.DataFrame):
+                                    try:
+                                        # Get the strategy type from parameters or name
+                                        strategy_name = result['parameters'].get('strategy_type', 'Unknown Strategy')
+                                        if strategy_name == 'Unknown Strategy':
+                                            # Try to extract from the name
+                                            name_parts = result['name'].split()
+                                            for part in name_parts:
+                                                if 'DCA' in part:
+                                                    strategy_name = part
+                                                    break
+                                        
+                                        # Get parameters
+                                        params = result['parameters']
+                                        
+                                        # Save the results using ResultsManager
+                                        filepath = results_manager.save_backtest_results(
+                                            results=result['results'],
+                                            strategy_name=strategy_name,
+                                            params=params
+                                        )
+                                        saved_count += 1
+                                    except Exception as e:
+                                        st.error(f"Error saving result: {str(e)}")
+                                else:
+                                    st.warning(f"Result '{result['name']}' has incomplete data and cannot be saved.")
+                        
+                        if saved_count > 0:
+                            st.success(f"Successfully saved {saved_count} results to disk.")
+                        else:
+                            st.warning("No results were saved. Please make sure you select valid backtest results.")
+            
+            # Clear all results section
+            st.markdown("#### Clear All Results")
+            
+            if st.button("Clear All Session Results", key="clear_all"):
+                st.session_state.saved_backtests = []
+                st.session_state.saved_results = []
+                all_saved_results = backtest_results_from_disk + optimization_results_from_disk
+                st.success("All saved results have been cleared from session. Note: This does not delete results saved to disk.")
+                st.experimental_rerun()

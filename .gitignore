@@ -1,0 +1,86 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Data files
+*.csv
+*.zip
+credentials.json
+*.json.bak
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+log/
+
+# GCP deployment files
+*.pem
+*.key
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Exclude large directories to make GitHub push manageable
+# Only include essential files for basic repository structure
+/GoogleCloudAuth/
+/assets/
+/attached_assets/
+/backtesting/
+/cleaned_project/
+/crypto-quant-vision-main-2/
+/data/
+/deployment_package/
+/examples/
+/gcp_deploy/
+/install_package/
+/minimal_deployment_package/
+/minimal_package/
+/results/
+/src/
+/strategy/
+/trading_bot/
+/updated_deployment/
+/utils/
+/visualization/
+# Exclude most deploy scripts, keeping only essential ones
+*deploy*.py
+*check*.py
+!deploy_noninteractive.py
+!deploy_to_gcp.py

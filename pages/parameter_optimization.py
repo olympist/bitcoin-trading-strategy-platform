@@ -1,0 +1,2775 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import os
+import sys
+import time
+import re
+from datetime import datetime, date
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from typing import Dict, List, Optional, Tuple, Union
+
+# Ensure we can import from parent directory
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import project modules
+from utils.data_fetcher import DataFetcher
+from strategy.variable_timeframe_dca import VariableTimeframeDCA
+from strategy.alternative_dca import AlternativeDCA
+from strategy.fixed_investment_dca import FixedInvestmentDCA
+from strategy.liquidity_managed_dca import LiquidityManagedDCA
+from strategy.optimized_alternative_dca_v4 import OptimizedAlternativeDCAv4
+from strategy.optimized_alternative_dca_v5 import OptimizedAlternativeDCAv5
+from backtesting.optimizer import ParameterOptimizer
+from visualization import PerformancePlots
+
+st.set_page_config(
+    page_title="Parameter Optimization - Bitcoin Backtesting Platform",
+    page_icon="🔍",
+    layout="wide"
+)
+
+# Initialize session state variables if they don't exist
+if 'data_files' not in st.session_state:
+    st.session_state.data_files = []
+if 'selected_data' not in st.session_state:
+    st.session_state.selected_data = None
+if 'data_cache' not in st.session_state:
+    st.session_state.data_cache = {}
+if 'optimization_results' not in st.session_state:
+    st.session_state.optimization_results = None
+if 'completed_tests' not in st.session_state:
+    st.session_state.completed_tests = []
+if 'current_progress' not in st.session_state:
+    st.session_state.current_progress = 0
+
+# Initialize data fetcher
+data_fetcher = DataFetcher()
+
+# Load custom CSS
+st.markdown("""
+<style>
+    .section-header {
+        font-size: 1.5rem;
+        color: #f7931a;
+        font-weight: bold;
+        margin-bottom: 1rem;
+    }
+    .info-box {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin-bottom: 1rem;
+    }
+    .stButton button {
+        background-color: #f7931a;
+        color: white;
+    }
+    .metric-container {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        text-align: center;
+    }
+    .metric-value {
+        font-size: 1.5rem;
+        font-weight: bold;
+    }
+    .metric-label {
+        font-size: 0.8rem;
+        color: gray;
+    }
+    .param-container {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin-bottom: 1rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Page header
+st.markdown('<p class="section-header">Strategy Parameter Optimization</p>', unsafe_allow_html=True)
+st.markdown("Optimize Bitcoin DCA strategy parameters for best performance. Compare different strategy types and find the optimal settings.")
+
+# Sidebar for data selection and optimization settings
+with st.sidebar:
+    st.header("Optimization Configuration")
+    
+    # Data selection section
+    st.subheader("1. Choose Bitcoin Price Data")
+    
+    # If data files list is empty, load it
+    if not st.session_state.data_files:
+        st.session_state.data_files = data_fetcher.list_saved_data()
+    
+    if not st.session_state.data_files:
+        st.warning("📋 No price data available. Please visit the Data Manager page to download Bitcoin price history first.")
+    else:
+        # Create a dataframe for selection
+        df_files = pd.DataFrame(st.session_state.data_files)
+        
+        st.markdown("""
+        <div style="background-color: #e6f2ff; padding: 10px; border-radius: 5px; margin-bottom: 10px;">
+        <p style="margin-bottom: 5px;"><strong>🔍 Select Price Data for Optimization</strong></p>
+        <p style="font-size: 0.9em; margin-bottom: 0;">Choose the Bitcoin price data to use for parameter optimization. Larger datasets provide more robust results but take longer to process.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # File selection with improved formatting
+        selected_file = st.selectbox(
+            "Bitcoin Price Source",
+            options=df_files['filename'].tolist(),
+            format_func=lambda x: f"{df_files.loc[df_files['filename'] == x, 'exchange'].iloc[0].capitalize()} • {df_files.loc[df_files['filename'] == x, 'symbol'].iloc[0]} • {df_files.loc[df_files['filename'] == x, 'timeframe'].iloc[0]} data"
+        )
+        
+        # Get the filepath
+        filepath = df_files[df_files['filename'] == selected_file]['filepath'].iloc[0]
+        
+        # Load the data if not already in cache
+        if filepath in st.session_state.data_cache:
+            df = st.session_state.data_cache[filepath]
+        else:
+            df = data_fetcher.load_data(filepath)
+            if df is not None:
+                st.session_state.data_cache[filepath] = df
+        
+        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+            st.error(f"❌ Could not load data from {selected_file}. The file may be corrupted.")
+        else:
+            # Store in session state
+            st.session_state.selected_data = df
+            
+            # Calculate date range and points
+            start_date = df.index.min().date()
+            end_date = df.index.max().date()
+            data_points = len(df)
+            date_range = (end_date - start_date).days
+            
+            # Show enhanced data info
+            st.markdown(f"""
+            <div style="background-color: #e6ffe6; padding: 10px; border-radius: 5px;">
+            <p style="margin-bottom: 5px;"><strong>✅ Data Ready for Optimization</strong></p>
+            <p style="font-size: 0.9em; margin-bottom: 0;">
+            <span style="font-weight: bold;">Date Range:</span> {start_date} to {end_date} ({date_range} days)<br>
+            <span style="font-weight: bold;">Data Points:</span> {data_points} price records<br>
+            <span style="font-weight: bold;">Source:</span> {df_files.loc[df_files['filename'] == selected_file, 'exchange'].iloc[0].capitalize()}
+            </p>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    # Date range filter
+    if st.session_state.selected_data is not None:
+        st.subheader("2. Date Range (Optional)")
+        
+        df = st.session_state.selected_data
+        date_min = df.index.min().date()
+        date_max = df.index.max().date()
+        
+        start_date = st.date_input(
+            "Start Date",
+            value=date_min,
+            min_value=date_min,
+            max_value=date_max
+        )
+        
+        end_date = st.date_input(
+            "End Date",
+            value=date_max,
+            min_value=date_min,
+            max_value=date_max
+        )
+    
+    # Optimization settings
+    st.subheader("3. Optimization Settings")
+    
+    # Create a session state variable to track if optimization is running
+    if 'is_optimizing' not in st.session_state:
+        st.session_state.is_optimizing = False
+    
+    # Split form into two - one for parameters and one for optimization
+    with st.form("optimization_parameters_form"):
+        # Fixed parameter - Initial Capital
+        initial_capital = st.number_input(
+            "Initial Capital (USDT)",
+            min_value=100.0,
+            # Removed capital limitation
+            value=1800.0,
+            step=100.0
+        )
+        
+        # Fixed parameter - Trading Fee
+        trading_fee_pct = st.number_input(
+            "Trading Fee (%)",
+            min_value=0.01,
+            # Removed trading fee limitation
+            value=0.1,
+            step=0.01
+        )
+        
+        # Strategy Type Selection
+        strategy_type = st.selectbox(
+            "Strategy Type",
+            options=["Original DCA", "Alternative DCA", "Optimized Alternative DCA", "Optimized Alternative DCA v4", "Optimized Alternative DCA v5", "Optimized Alternative DCA v6", "Fixed Investment DCA", "Liquidity-Managed DCA", "Interval DCA"],
+            index=4,  # Select "Optimized Alternative DCA v5" by default
+            help="Original DCA: Reference price updates on new highs, resets after sell. Alternative DCA: Reference price resets after each buy. Optimized Alternative DCA: Enhanced version with risk management and trend filtering. Optimized Alternative DCA v4: Simplified version without MA period parameter. Optimized Alternative DCA v5: Multi-bot capability with variable start dates. Fixed Investment DCA: Invests a fixed percentage of initial capital each time. Liquidity-Managed DCA: Adapts investment amounts based on price action and remaining capital. Interval DCA: Makes fixed investments at regular time intervals."
+        )
+        
+        # Submit button for parameters form
+        parameters_submitted = st.form_submit_button("Save Parameters")
+        
+        st.markdown("#### Parameters to Optimize")
+        
+        # Show different parameter inputs based on strategy type
+        if strategy_type == "Optimized Alternative DCA v6":
+            # Core parameters for Optimized Alternative DCA v6
+            st.markdown("##### Core Parameters")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Investment Amount (%)**")
+                inv_min = st.number_input("Min", min_value=0.1, value=5.0, step=0.1, key="inv_min_v6")
+                inv_max = st.number_input("Max", min_value=0.1, value=25.0, step=0.1, key="inv_max_v6")
+                inv_step = st.number_input("Step", min_value=0.1, value=5.0, step=0.1, key="inv_step_v6")
+            
+            with col2:
+                st.markdown("**Price Drop Threshold (%)**")
+                drop_min = st.number_input("Min", min_value=0.1, value=1.0, step=0.1, key="drop_min_v6")
+                drop_max = st.number_input("Max", min_value=0.1, value=5.0, step=0.1, key="drop_max_v6")
+                drop_step = st.number_input("Step", min_value=0.1, value=1.0, step=0.1, key="drop_step_v6")
+            
+            st.markdown("**Profit Threshold (%)**")
+            profit_min = st.number_input("Min", min_value=0.1, value=1.0, step=0.1, key="profit_min_v6")
+            profit_max = st.number_input("Max", min_value=0.1, value=5.0, step=0.1, key="profit_max_v6")
+            profit_step = st.number_input("Step", min_value=0.1, value=1.0, step=0.1, key="profit_step_v6")
+            
+            # Risk Management Parameters
+            st.markdown("##### Risk Management Parameters")
+            
+            # Add a toggle for risk management parameter optimization
+            optimize_risk = st.checkbox("Optimize Risk Management Parameters", value=False, 
+                                     help="Enable to include risk management parameters in optimization grid search", key="optimize_risk_v6")
+            
+            if optimize_risk:
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.markdown("**Stop Loss Fixed (%)**")
+                    stop_loss_min = st.number_input("Min", min_value=5.0, value=10.0, step=1.0, key="stop_loss_min_v6")
+                    stop_loss_max = st.number_input("Max", min_value=5.0, value=20.0, step=1.0, key="stop_loss_max_v6")
+                    stop_loss_step = st.number_input("Step", min_value=1.0, value=5.0, step=1.0, key="stop_loss_step_v6")
+                
+                with col2:
+                    st.markdown("**Trailing Stop (%)**")
+                    trail_stop_min = st.number_input("Min", min_value=0.5, value=1.0, step=0.1, key="trail_stop_min_v6")
+                    trail_stop_max = st.number_input("Max", min_value=0.5, value=2.0, step=0.1, key="trail_stop_max_v6")
+                    trail_stop_step = st.number_input("Step", min_value=0.1, value=0.5, step=0.1, key="trail_stop_step_v6")
+                
+                with col3:
+                    st.markdown("**Max Position Duration (days)**")
+                    max_duration_min = st.number_input("Min", min_value=30, value=90, step=30, key="max_duration_min_v6")
+                    max_duration_max = st.number_input("Max", min_value=30, value=180, step=30, key="max_duration_max_v6")
+                    max_duration_step = st.number_input("Step", min_value=30, value=30, step=30, key="max_duration_step_v6")
+                
+                # These parameters will be ranges for optimization
+                stop_loss_fixed_pct = np.arange(stop_loss_min, stop_loss_max + stop_loss_step/2, stop_loss_step).tolist()
+                trailing_stop_pct = np.arange(trail_stop_min, trail_stop_max + trail_stop_step/2, trail_stop_step).tolist()
+                max_position_duration = np.arange(max_duration_min, max_duration_max + max_duration_step/2, max_duration_step).tolist()
+            
+            else:
+                # If not optimizing, use fixed values
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    stop_loss_fixed_pct = st.number_input("Stop Loss Fixed (%)", min_value=0.0, value=15.0, step=1.0, key="stop_loss_v6")
+                    trailing_stop_pct = st.number_input("Trailing Stop (%)", min_value=0.0, value=1.5, step=0.1, key="trailing_stop_v6")
+                
+                with col2:
+                    max_position_duration = st.number_input("Max Position Duration (days)", min_value=1, value=180, step=30, key="max_duration_v6")
+                
+                # Advanced profit-taking settings
+                st.markdown("**Advanced Profit-Taking Settings**")
+                profit_col1, profit_col2, profit_col3 = st.columns(3)
+                
+                with profit_col1:
+                    # Partial profit taking toggle
+                    partial_profit_taking = st.checkbox("Enable Partial Profit Taking", value=False, key="partial_profit_taking_v6",
+                                                      help="If enabled, only a portion of the position will be sold when profit target is hit")
+                
+                with profit_col2:
+                    # Profit taking percentage
+                    profit_taking_percentage = st.number_input("Profit Taking %", min_value=10.0, max_value=100.0, value=50.0, step=10.0,
+                                                             help="Percentage of position to sell when taking partial profits (10-100%)",
+                                                             key="profit_taking_percentage_v6")
+                
+                with profit_col3:
+                    # Trailing stop activation
+                    trailing_stop_activation_pct = st.number_input("Trail. Stop Activation %", min_value=0.5, value=1.5, step=0.5,
+                                                                 help="Profit percentage required to activate trailing stop",
+                                                                 key="trailing_stop_activation_v6")
+                    
+                    # Trailing stop as main mechanism
+                    use_trailing_stop_main = st.checkbox("Use Trailing Stop as Primary", value=True, key="use_trailing_stop_main_v6",
+                                                      help="If enabled, trailing stop becomes the primary profit-protection mechanism")
+                
+                # Convert to lists for param_grid
+                stop_loss_fixed_pct = [stop_loss_fixed_pct]
+                trailing_stop_pct = [trailing_stop_pct]
+                max_position_duration = [max_position_duration]
+                partial_profit_taking = [partial_profit_taking]
+                profit_taking_percentage = [profit_taking_percentage]
+                trailing_stop_activation_pct = [trailing_stop_activation_pct]
+                use_trailing_stop_main = [use_trailing_stop_main]
+            
+            # Bot Action Interval selection
+            st.markdown("##### Bot Action Interval (Timeframe Resampling)")
+            st.info("Configure how frequently your bots evaluate the market and potentially execute trades")
+            
+            # Add a toggle for bot action interval optimization
+            optimize_interval = st.checkbox("Optimize Bot Action Interval", value=False, key="optimize_interval_v6")
+            
+            if optimize_interval:
+                bot_action_intervals = st.multiselect(
+                    "Bot Action Intervals to Test",
+                    options=["1min", "5min", "15min", "30min", "1h", "4h", "1d"],
+                    default=["15min", "1h", "4h"],
+                    help="Select timeframes to test for bot actions")
+                
+                if not bot_action_intervals:
+                    st.warning("Please select at least one interval")
+                    bot_action_intervals = ["15min"]
+            else:
+                bot_action_intervals = [st.selectbox(
+                    "Bot Action Interval",
+                    options=["1min", "5min", "15min", "30min", "1h", "4h", "1d"],
+                    index=2,  # Default to 15min
+                    help="Choose how frequently bots should evaluate and potentially execute trades"
+                )]
+                
+            # Multi-bot Parameters
+            st.markdown("##### Multi-Bot Parameters")
+            
+            # Bot count options
+            col1, col2 = st.columns(2)
+            with col1:
+                optimize_num_bots = st.checkbox("Optimize Number of Bots", value=False, key="optimize_num_bots_v6")
+                
+            with col2:
+                if optimize_num_bots:
+                    min_bots = st.number_input("Min Bots", min_value=1, value=1, step=1, key="min_bots_v6")
+                    max_bots = st.number_input("Max Bots", min_value=1, value=5, step=1, key="max_bots_v6")
+                    number_of_bots = list(range(min_bots, max_bots + 1))
+                else:
+                    number_of_bots = [st.number_input("Number of Bots", min_value=1, value=3, step=1, key="num_bots_v6")]
+            
+            # Bot start configuration
+            st.markdown("**Bot Start Configuration**")
+            st.markdown("*Each bot receives the full initial capital and can start at a different date/time in the dataset*")
+            
+            # Option to distribute bots evenly, use uniform deployment, or use custom start dates
+            bot_distribution = st.radio(
+                "How should bots be distributed?",
+                ["Evenly distribute across dataset", "Use uniform deployment", "Use custom start dates/times"],
+                index=0,
+                key="bot_distribution_v6"
+            )
+            
+            # Handle uniform deployment option
+            uniform_deployment = False
+            uniform_deployment_days = None
+            
+            if bot_distribution == "Use uniform deployment":
+                uniform_deployment = True
+                uniform_deployment_days = st.number_input(
+                    "Days between bots", 
+                    min_value=1, 
+                    value=30, 
+                    step=1,
+                    help="Number of days between each bot's start date",
+                    key="uniform_days_v6"
+                )
+            
+            # Define custom start dates if selected
+            elif bot_distribution == "Use custom start dates/times":
+                st.markdown("*Enter start dates for optimization (leave empty to use automatic distribution)*")
+                start_dates = st.text_input(
+                    "Start Dates (comma-separated YYYY-MM-DD)", 
+                    value="", 
+                    key="start_dates_v6",
+                    help="Example: 2023-01-01,2023-04-01,2023-07-01 for 3 bots"
+                )
+                
+                start_times = st.text_input(
+                    "Start Times (comma-separated HH:MM)", 
+                    value="", 
+                    key="start_times_v6",
+                    help="Example: 00:00,08:00,16:00 for 3 bots"
+                )
+                
+                # Process start dates and times for param_grid
+                if start_dates.strip():
+                    # Format dates properly to ensure YYYY-MM-DD format
+                    try:
+                        bots_starting_dates = [date.strip() for date in start_dates.split(',')]
+                        # Ensure all dates are in the correct format
+                        for i, date_str in enumerate(bots_starting_dates):
+                            if '/' in date_str:  # Convert from MM/DD/YYYY to YYYY-MM-DD
+                                parts = date_str.split('/')
+                                if len(parts) == 3:
+                                    if len(parts[2]) == 4:  # MM/DD/YYYY
+                                        bots_starting_dates[i] = f"{parts[2]}-{parts[0].zfill(2)}-{parts[1].zfill(2)}"
+                                    else:  # Assume DD/MM/YYYY
+                                        bots_starting_dates[i] = f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+                        
+                        st.write(f"Using bot start dates: {', '.join(bots_starting_dates)}")
+                    except Exception as e:
+                        st.error(f"Error processing dates: {str(e)}")
+                        bots_starting_dates = None  # Fallback to automatic distribution
+                else:
+                    bots_starting_dates = None  # Let strategy handle distribution
+                    
+                if start_times.strip():
+                    try:
+                        bots_starting_times = [time.strip() for time in start_times.split(',')]
+                        # Ensure all times are in HH:MM format
+                        for i, time_str in enumerate(bots_starting_times):
+                            if ':' in time_str:
+                                parts = time_str.split(':')
+                                if len(parts) == 2:
+                                    bots_starting_times[i] = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+                        
+                        st.write(f"Using bot start times: {', '.join(bots_starting_times)}")
+                    except Exception as e:
+                        st.error(f"Error processing times: {str(e)}")
+                        bots_starting_times = None  # Fallback to automatic distribution
+                else:
+                    bots_starting_times = None  # Let strategy handle distribution
+            else:
+                # Use default distribution
+                bots_starting_dates = None
+                bots_starting_times = None
+                
+        elif strategy_type == "Optimized Alternative DCA v5":
+            # Core parameters for Optimized Alternative DCA v5
+            st.markdown("##### Core Parameters")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Investment Amount (%)**")
+                inv_min = st.number_input("Min", min_value=0.1, value=5.0, step=0.1, key="inv_min_v5")
+                inv_max = st.number_input("Max", min_value=0.1, value=25.0, step=0.1, key="inv_max_v5")
+                inv_step = st.number_input("Step", min_value=0.1, value=5.0, step=0.1, key="inv_step_v5")
+            
+            with col2:
+                st.markdown("**Price Drop Threshold (%)**")
+                drop_min = st.number_input("Min", min_value=0.1, value=1.0, step=0.1, key="drop_min_v5")
+                drop_max = st.number_input("Max", min_value=0.1, value=5.0, step=0.1, key="drop_max_v5")
+                drop_step = st.number_input("Step", min_value=0.1, value=1.0, step=0.1, key="drop_step_v5")
+            
+            st.markdown("**Profit Threshold (%)**")
+            profit_min = st.number_input("Min", min_value=0.1, value=1.0, step=0.1, key="profit_min_v5")
+            profit_max = st.number_input("Max", min_value=0.1, value=5.0, step=0.1, key="profit_max_v5")
+            profit_step = st.number_input("Step", min_value=0.1, value=1.0, step=0.1, key="profit_step_v5")
+            
+            # Risk Management Parameters
+            st.markdown("##### Risk Management Parameters")
+            
+            # Add a toggle for risk management parameter optimization
+            optimize_risk = st.checkbox("Optimize Risk Management Parameters", value=False, 
+                                     help="Enable to include risk management parameters in optimization grid search", key="optimize_risk_v5")
+            
+            if optimize_risk:
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.markdown("**Stop Loss Fixed (%)**")
+                    stop_loss_min = st.number_input("Min", min_value=5.0, value=10.0, step=1.0, key="stop_loss_min_v5")
+                    stop_loss_max = st.number_input("Max", min_value=5.0, value=20.0, step=1.0, key="stop_loss_max_v5")
+                    stop_loss_step = st.number_input("Step", min_value=1.0, value=5.0, step=1.0, key="stop_loss_step_v5")
+                
+                with col2:
+                    st.markdown("**Trailing Stop (%)**")
+                    trail_stop_min = st.number_input("Min", min_value=0.5, value=1.0, step=0.1, key="trail_stop_min_v5")
+                    trail_stop_max = st.number_input("Max", min_value=0.5, value=2.0, step=0.1, key="trail_stop_max_v5")
+                    trail_stop_step = st.number_input("Step", min_value=0.1, value=0.5, step=0.1, key="trail_stop_step_v5")
+                
+                with col3:
+                    st.markdown("**Max Position Duration (days)**")
+                    max_duration_min = st.number_input("Min", min_value=30, value=90, step=30, key="max_duration_min_v5")
+                    max_duration_max = st.number_input("Max", min_value=30, value=180, step=30, key="max_duration_max_v5")
+                    max_duration_step = st.number_input("Step", min_value=30, value=30, step=30, key="max_duration_step_v5")
+                
+                # These parameters will be ranges for optimization
+                stop_loss_fixed_pct = np.arange(stop_loss_min, stop_loss_max + stop_loss_step/2, stop_loss_step).tolist()
+                trailing_stop_pct = np.arange(trail_stop_min, trail_stop_max + trail_stop_step/2, trail_stop_step).tolist()
+                max_position_duration = np.arange(max_duration_min, max_duration_max + max_duration_step/2, max_duration_step).tolist()
+            
+            else:
+                # If not optimizing, use fixed values
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    stop_loss_fixed_pct = st.number_input("Stop Loss Fixed (%)", min_value=0.0, value=15.0, step=1.0, key="stop_loss_v5")
+                    trailing_stop_pct = st.number_input("Trailing Stop (%)", min_value=0.0, value=1.5, step=0.1, key="trailing_stop_v5")
+                
+                with col2:
+                    max_position_duration = st.number_input("Max Position Duration (days)", min_value=1, value=180, step=30, key="max_duration_v5")
+                
+                # Advanced profit-taking settings
+                st.markdown("**Advanced Profit-Taking Settings**")
+                profit_col1, profit_col2, profit_col3 = st.columns(3)
+                
+                with profit_col1:
+                    # Partial profit taking toggle
+                    partial_profit_taking = st.checkbox("Enable Partial Profit Taking", value=False, key="partial_profit_taking",
+                                                      help="If enabled, only a portion of the position will be sold when profit target is hit")
+                
+                with profit_col2:
+                    # Profit taking percentage
+                    profit_taking_percentage = st.number_input("Profit Taking %", min_value=10.0, max_value=100.0, value=50.0, step=10.0,
+                                                             help="Percentage of position to sell when taking partial profits (10-100%)")
+                
+                with profit_col3:
+                    # Trailing stop activation
+                    trailing_stop_activation_pct = st.number_input("Trail. Stop Activation %", min_value=0.5, value=1.5, step=0.5,
+                                                                 help="Profit percentage required to activate trailing stop")
+                    
+                    # Trailing stop as main mechanism
+                    use_trailing_stop_main = st.checkbox("Use Trailing Stop as Primary", value=True, key="use_trailing_stop_main",
+                                                      help="If enabled, trailing stop becomes the primary profit-protection mechanism")
+                
+                # Convert to lists for param_grid
+                stop_loss_fixed_pct = [stop_loss_fixed_pct]
+                trailing_stop_pct = [trailing_stop_pct]
+                max_position_duration = [max_position_duration]
+                partial_profit_taking = [partial_profit_taking]
+                profit_taking_percentage = [profit_taking_percentage]
+                trailing_stop_activation_pct = [trailing_stop_activation_pct]
+                use_trailing_stop_main = [use_trailing_stop_main]
+                
+            # Multi-bot Parameters
+            st.markdown("##### Multi-Bot Parameters")
+            
+            # Bot count options
+            col1, col2 = st.columns(2)
+            with col1:
+                optimize_num_bots = st.checkbox("Optimize Number of Bots", value=False, key="optimize_num_bots")
+                
+            with col2:
+                if optimize_num_bots:
+                    min_bots = st.number_input("Min Bots", min_value=1, value=1, step=1, key="min_bots")
+                    max_bots = st.number_input("Max Bots", min_value=1, value=5, step=1, key="max_bots")
+                    number_of_bots = list(range(min_bots, max_bots + 1))
+                else:
+                    number_of_bots = [st.number_input("Number of Bots", min_value=1, value=3, step=1, key="num_bots_v5")]
+            
+            # Bot start configuration
+            st.markdown("**Bot Start Configuration**")
+            st.markdown("*Each bot receives the full initial capital and can start at a different date/time in the dataset*")
+            
+            # Help expander for bot configuration
+            with st.expander("ℹ️ How do multi-bot strategies work?"):
+                st.markdown("""
+                **Multi-Bot Strategy Design:**
+                - Each bot receives the **full initial capital** independently
+                - Bots can start trading at different dates/times
+                - Each bot makes its own buy/sell decisions
+                - Results are consolidated to evaluate the overall strategy performance
+                - This allows testing how the timing of strategy deployment affects returns
+                """)
+            
+            # Option to distribute bots evenly, use uniform deployment, or use custom start dates
+            bot_distribution = st.radio(
+                "How should bots be distributed?",
+                ["Evenly distribute across dataset", "Use uniform deployment", "Use custom start dates/times"],
+                index=0,
+                key="bot_distribution"
+            )
+            
+            # Handle uniform deployment option
+            uniform_deployment = False
+            uniform_deployment_days = None
+            
+            if bot_distribution == "Use uniform deployment":
+                uniform_deployment = True
+                uniform_deployment_days = st.number_input(
+                    "Days between bots", 
+                    min_value=1, 
+                    # Removed bot deployment days limitation
+                    value=30, 
+                    step=1,
+                    help="Number of days between each bot's start date"
+                )
+            
+            # Define custom start dates if selected
+            elif bot_distribution == "Use custom start dates/times":
+                st.markdown("*Enter start dates for optimization (leave empty to use automatic distribution)*")
+                start_dates = st.text_input(
+                    "Start Dates (comma-separated YYYY-MM-DD)", 
+                    value="", 
+                    key="start_dates",
+                    help="Example: 2023-01-01,2023-04-01,2023-07-01 for 3 bots"
+                )
+                
+                start_times = st.text_input(
+                    "Start Times (comma-separated HH:MM)", 
+                    value="", 
+                    key="start_times",
+                    help="Example: 00:00,08:00,16:00 for 3 bots"
+                )
+                
+                # Process start dates and times for param_grid
+                if start_dates.strip():
+                    # Format dates properly to ensure YYYY-MM-DD format
+                    try:
+                        bots_starting_dates = [date.strip() for date in start_dates.split(',')]
+                        # Ensure all dates are in the correct format
+                        for i, date_str in enumerate(bots_starting_dates):
+                            if '/' in date_str:  # Convert from MM/DD/YYYY to YYYY-MM-DD
+                                parts = date_str.split('/')
+                                if len(parts) == 3:
+                                    if len(parts[2]) == 4:  # MM/DD/YYYY
+                                        bots_starting_dates[i] = f"{parts[2]}-{parts[0].zfill(2)}-{parts[1].zfill(2)}"
+                                    else:  # Assume DD/MM/YYYY
+                                        bots_starting_dates[i] = f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+                        
+                        st.write(f"Using bot start dates: {', '.join(bots_starting_dates)}")
+                    except Exception as e:
+                        st.error(f"Error processing dates: {str(e)}")
+                        bots_starting_dates = None  # Fallback to automatic distribution
+                else:
+                    bots_starting_dates = None  # Let strategy handle distribution
+                    
+                if start_times.strip():
+                    try:
+                        bots_starting_times = [time.strip() for time in start_times.split(',')]
+                        # Ensure all times are in HH:MM format
+                        for i, time_str in enumerate(bots_starting_times):
+                            if ':' in time_str:
+                                parts = time_str.split(':')
+                                if len(parts) == 2:
+                                    bots_starting_times[i] = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+                        
+                        st.write(f"Using bot start times: {', '.join(bots_starting_times)}")
+                    except Exception as e:
+                        st.error(f"Error processing times: {str(e)}")
+                        bots_starting_times = None  # Fallback to automatic distribution
+                else:
+                    bots_starting_times = None  # Let strategy handle distribution
+            else:
+                # Use default distribution
+                bots_starting_dates = None
+                bots_starting_times = None
+            
+        elif strategy_type == "Optimized Alternative DCA v4":
+            # Core parameters for Optimized Alternative DCA v4
+            st.markdown("##### Core Parameters")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Investment Amount (%)**")
+                inv_min = st.number_input("Min", min_value=0.1, value=5.0, step=0.1, key="inv_min_v4")
+                inv_max = st.number_input("Max", min_value=0.1, value=25.0, step=0.1, key="inv_max_v4")
+                inv_step = st.number_input("Step", min_value=0.1, value=5.0, step=0.1, key="inv_step_v4")
+            
+            with col2:
+                st.markdown("**Price Drop Threshold (%)**")
+                drop_min = st.number_input("Min", min_value=0.1, value=1.0, step=0.1, key="drop_min_v4")
+                drop_max = st.number_input("Max", min_value=0.1, value=5.0, step=0.1, key="drop_max_v4")
+                drop_step = st.number_input("Step", min_value=0.1, value=1.0, step=0.1, key="drop_step_v4")
+            
+            st.markdown("**Profit Threshold (%)**")
+            profit_min = st.number_input("Min", min_value=0.1, value=1.0, step=0.1, key="profit_min_v4")
+            profit_max = st.number_input("Max", min_value=0.1, value=5.0, step=0.1, key="profit_max_v4")
+            profit_step = st.number_input("Step", min_value=0.1, value=1.0, step=0.1, key="profit_step_v4")
+            
+            # Risk Management Parameters
+            st.markdown("##### Risk Management Parameters")
+            
+            # Add a toggle for risk management parameter optimization
+            optimize_risk = st.checkbox("Optimize Risk Management Parameters", value=False, 
+                                      help="Enable to include risk management parameters in optimization grid search")
+            
+            if optimize_risk:
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.markdown("**Stop Loss Fixed (%)**")
+                    stop_loss_min = st.number_input("Min", min_value=5.0, value=10.0, step=1.0, key="stop_loss_min_v4")
+                    stop_loss_max = st.number_input("Max", min_value=5.0, value=20.0, step=1.0, key="stop_loss_max_v4")
+                    stop_loss_step = st.number_input("Step", min_value=1.0, value=5.0, step=1.0, key="stop_loss_step_v4")
+                
+                with col2:
+                    st.markdown("**Trailing Stop (%)**")
+                    trail_stop_min = st.number_input("Min", min_value=0.5, value=1.0, step=0.1, key="trail_stop_min_v4")
+                    trail_stop_max = st.number_input("Max", min_value=0.5, value=2.0, step=0.1, key="trail_stop_max_v4")
+                    trail_stop_step = st.number_input("Step", min_value=0.1, value=0.5, step=0.1, key="trail_stop_step_v4")
+                
+                with col3:
+                    st.markdown("**Max Position Duration (days)**")
+                    max_duration_min = st.number_input("Min", min_value=30, value=90, step=30, key="max_duration_min_v4")
+                    max_duration_max = st.number_input("Max", min_value=30, value=180, step=30, key="max_duration_max_v4")
+                    max_duration_step = st.number_input("Step", min_value=30, value=30, step=30, key="max_duration_step_v4")
+                
+                # These parameters will be ranges for optimization
+                stop_loss_fixed_pct = np.arange(stop_loss_min, stop_loss_max + stop_loss_step/2, stop_loss_step).tolist()
+                trailing_stop_pct = np.arange(trail_stop_min, trail_stop_max + trail_stop_step/2, trail_stop_step).tolist()
+                max_position_duration = np.arange(max_duration_min, max_duration_max + max_duration_step/2, max_duration_step).tolist()
+            
+            else:
+                # If not optimizing, use fixed values
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    stop_loss_fixed_pct = st.number_input("Stop Loss Fixed (%)", min_value=0.0, value=15.0, step=1.0, key="stop_loss_v4")
+                    trailing_stop_pct = st.number_input("Trailing Stop (%)", min_value=0.0, value=1.5, step=0.1, key="trailing_stop_v4")
+                
+                with col2:
+                    max_position_duration = st.number_input("Max Position Duration (days)", min_value=1, value=180, step=30, key="max_duration_v4")
+                
+                # Convert to lists for param_grid
+                stop_loss_fixed_pct = [stop_loss_fixed_pct]
+                trailing_stop_pct = [trailing_stop_pct]
+                max_position_duration = [max_position_duration]
+            
+        elif strategy_type == "Optimized Alternative DCA":
+            # Core parameters for Optimized Alternative DCA
+            st.markdown("##### Core Parameters")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Investment Amount (%)**")
+                inv_min = st.number_input("Min", min_value=0.1, value=5.0, step=0.1, key="inv_min")
+                inv_max = st.number_input("Max", min_value=0.1, value=25.0, step=0.1, key="inv_max")
+                inv_step = st.number_input("Step", min_value=0.1, value=5.0, step=0.1, key="inv_step")
+            
+            with col2:
+                st.markdown("**Price Drop Threshold (%)**")
+                drop_min = st.number_input("Min", min_value=0.1, value=1.0, step=0.1, key="drop_min")
+                drop_max = st.number_input("Max", min_value=0.1, value=5.0, step=0.1, key="drop_max")
+                drop_step = st.number_input("Step", min_value=0.1, value=1.0, step=0.1, key="drop_step")
+            
+            st.markdown("**Profit Threshold (%)**")
+            profit_min = st.number_input("Min", min_value=0.1, value=1.0, step=0.1, key="profit_min")
+            profit_max = st.number_input("Max", min_value=0.1, value=5.0, step=0.1, key="profit_max")
+            profit_step = st.number_input("Step", min_value=0.1, value=1.0, step=0.1, key="profit_step")
+            
+            # Advanced parameters (now customizable for optimization)
+            st.markdown("##### Advanced Parameters")
+            
+            # Add a toggle for advanced parameter optimization
+            optimize_advanced = st.checkbox("Optimize Advanced Parameters", value=False, 
+                                           help="Enable to include advanced parameters in optimization grid search")
+            
+            if optimize_advanced:
+                # Risk Management Parameters
+                st.markdown("**Risk Management**")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.markdown("**Stop Loss Fixed (%)**")
+                    stop_loss_min = st.number_input("Min", min_value=5.0, value=10.0, step=1.0, key="stop_loss_min")
+                    stop_loss_max = st.number_input("Max", min_value=5.0, value=20.0, step=1.0, key="stop_loss_max")
+                    stop_loss_step = st.number_input("Step", min_value=1.0, value=5.0, step=1.0, key="stop_loss_step")
+                
+                with col2:
+                    st.markdown("**ATR Stop Multiplier**")
+                    atr_mult_min = st.number_input("Min", min_value=1.0, value=2.0, step=0.5, key="atr_mult_min")
+                    atr_mult_max = st.number_input("Max", min_value=1.0, value=4.0, step=0.5, key="atr_mult_max")
+                    atr_mult_step = st.number_input("Step", min_value=0.5, value=1.0, step=0.5, key="atr_mult_step")
+                
+                with col3:
+                    st.markdown("**Trailing Stop (%)**")
+                    trail_stop_min = st.number_input("Min", min_value=0.5, value=1.0, step=0.1, key="trail_stop_min")
+                    trail_stop_max = st.number_input("Max", min_value=0.5, value=2.0, step=0.1, key="trail_stop_max")
+                    trail_stop_step = st.number_input("Step", min_value=0.1, value=0.5, step=0.1, key="trail_stop_step")
+                
+                # Technical Indicators and Order Management
+                st.markdown("**Technical Indicators & Order Management**")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.markdown("**Trend Filter MA Period**")
+                    ma_period_min = st.number_input("Min", min_value=10, value=30, step=10, key="ma_period_min")
+                    ma_period_max = st.number_input("Max", min_value=10, value=70, step=10, key="ma_period_max")
+                    ma_period_step = st.number_input("Step", min_value=10, value=20, step=10, key="ma_period_step")
+                
+                with col2:
+                    st.markdown("**Min Order Size (USDT)**")
+                    min_order_min = st.number_input("Min", min_value=10.0, value=30.0, step=10.0, key="min_order_min")
+                    min_order_max = st.number_input("Max", min_value=10.0, value=70.0, step=10.0, key="min_order_max")
+                    min_order_step = st.number_input("Step", min_value=10.0, value=20.0, step=10.0, key="min_order_step")
+                
+                with col3:
+                    st.markdown("**Max Capital Allocation (%)**")
+                    max_cap_min = st.number_input("Min", min_value=10.0, value=30.0, step=5.0, key="max_cap_min")
+                    max_cap_max = st.number_input("Max", min_value=10.0, value=70.0, step=5.0, key="max_cap_max")
+                    max_cap_step = st.number_input("Step", min_value=5.0, value=10.0, step=5.0, key="max_cap_step")
+                
+                # These parameters will be ranges for optimization
+                stop_loss_fixed_pct = np.arange(stop_loss_min, stop_loss_max + stop_loss_step/2, stop_loss_step).tolist()
+                atr_stop_multiplier = np.arange(atr_mult_min, atr_mult_max + atr_mult_step/2, atr_mult_step).tolist()
+                trailing_stop_pct = np.arange(trail_stop_min, trail_stop_max + trail_stop_step/2, trail_stop_step).tolist()
+                max_position_duration = [180]  # Keep fixed for now to avoid too large grid search
+                trend_filter_ma_period = np.arange(ma_period_min, ma_period_max + ma_period_step/2, ma_period_step).tolist()
+                volatility_atr_window = [14]  # Keep fixed for now to avoid too large grid search
+                min_order_size = np.arange(min_order_min, min_order_max + min_order_step/2, min_order_step).tolist()
+                order_aggregation_threshold = [2.0]  # Keep fixed for now to avoid too large grid search
+                trailing_stop_activation_pct = np.arange(trailing_act_min, trailing_act_max + trailing_act_step/2, trailing_act_step).tolist()
+            
+            else:
+                # If not optimizing, use fixed values as before
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Risk Management**")
+                    stop_loss_fixed_pct = st.number_input("Stop Loss Fixed (%)", min_value=0.0, value=15.0, step=1.0)
+                    atr_stop_multiplier = st.number_input("ATR Stop Multiplier", min_value=0.0, value=3.0, step=0.5)
+                    trailing_stop_pct = st.number_input("Trailing Stop (%)", min_value=0.0, value=1.5, step=0.1)
+                    max_position_duration = st.number_input("Max Position Duration (days)", min_value=1, value=180, step=30)
+                
+                with col2:
+                    st.markdown("**Technical Indicators**")
+                    trend_filter_ma_period = st.number_input("Trend Filter MA Period", min_value=1, value=50, step=10)
+                    volatility_atr_window = st.number_input("Volatility ATR Window", min_value=1, value=14, step=1)
+                    
+                    st.markdown("**Order Management**")
+                    min_order_size = st.number_input("Min Order Size (USDT)", min_value=0.0, value=50.0, step=10.0)
+                    order_aggregation_threshold = st.number_input("Order Aggregation Threshold (%)", min_value=0.0, value=2.0, step=0.5)
+                    trailing_stop_activation_pct = st.number_input("Trailing Stop Activation (%)", min_value=1.0, value=1.5, step=0.1)
+                
+                # Convert to lists for param_grid
+                stop_loss_fixed_pct = [stop_loss_fixed_pct]
+                atr_stop_multiplier = [atr_stop_multiplier]
+                trailing_stop_pct = [trailing_stop_pct]
+                max_position_duration = [max_position_duration]
+                trend_filter_ma_period = [trend_filter_ma_period]
+                volatility_atr_window = [volatility_atr_window]
+                min_order_size = [min_order_size]
+                order_aggregation_threshold = [order_aggregation_threshold]
+                trailing_stop_activation_pct = [trailing_stop_activation_pct]
+            
+        elif strategy_type == "Liquidity-Managed DCA":
+            # Liquidity-Managed DCA specific parameters - all as percentages of remaining capital
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Invest Increase Amount (% of Remaining Capital)**")
+                invest_inc_min = st.number_input("Min", min_value=0.1, value=0.5, step=0.1, key="invest_inc_min")
+                invest_inc_max = st.number_input("Max", min_value=0.1, value=1.5, step=0.1, key="invest_inc_max")
+                invest_inc_step = st.number_input("Step", min_value=0.1, value=0.5, step=0.1, key="invest_inc_step")
+                
+                st.markdown("**Invest Flat Amount (% of Remaining Capital)**")
+                invest_flat = st.number_input("Value", min_value=0.1, value=1.0, step=0.1, key="invest_flat_value")
+            
+            with col2:
+                st.markdown("**Invest Drop Significant Amount (% of Remaining Capital)**")
+                invest_drop_sig = st.number_input("Value", min_value=0.1, value=3.0, step=0.1, key="invest_drop_sig_value")
+                
+                st.markdown("**Invest Drop Non-Significant Amount (% of Remaining Capital)**")
+                invest_drop_non = st.number_input("Value", min_value=0.1, value=1.5, step=0.1, key="invest_drop_non_value")
+            
+            # Common parameters for Liquidity-Managed DCA
+            st.markdown("**Drop Threshold (%)**")
+            drop_min = st.number_input("Min", min_value=0.1, value=1.0, step=0.1, key="drop_min")
+            drop_max = st.number_input("Max", min_value=0.1, value=3.0, step=0.1, key="drop_max")
+            drop_step = st.number_input("Step", min_value=0.1, value=0.5, step=0.1, key="drop_step")
+            
+            st.markdown("**Exit Profit Margin (%)**")
+            profit_min = st.number_input("Min", min_value=0.1, value=1.0, step=0.1, key="profit_min")
+            profit_max = st.number_input("Max", min_value=0.1, value=3.0, step=0.1, key="profit_max")
+            profit_step = st.number_input("Step", min_value=0.1, value=0.5, step=0.1, key="profit_step")
+            # Note: Exit profit margin optimization centered around the 2.0% optimized value
+            
+        elif strategy_type == "Interval DCA":
+            # Interval DCA specific parameters
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**DCA Amount (Fixed USD)**")
+                dca_amount_min = st.number_input("Min", min_value=1.0, value=20.0, step=5.0, key="dca_amount_min")
+                dca_amount_max = st.number_input("Max", min_value=1.0, value=100.0, step=5.0, key="dca_amount_max")
+                dca_amount_step = st.number_input("Step", min_value=1.0, value=20.0, step=5.0, key="dca_amount_step")
+            
+            with col2:
+                st.markdown("**Interval (Minutes)**")
+                interval_min = st.number_input("Min", min_value=1, value=15, step=15, key="interval_min")
+                interval_max = st.number_input("Max", min_value=1, value=240, step=15, key="interval_max")
+                interval_step = st.number_input("Step", min_value=1, value=15, step=15, key="interval_step")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Profit Target (%)**")
+                profit_min = st.number_input("Min", min_value=0.1, value=1.0, step=0.5, key="profit_min")
+                profit_max = st.number_input("Max", min_value=0.1, value=5.0, step=0.5, key="profit_max")
+                profit_step = st.number_input("Step", min_value=0.1, value=0.5, step=0.1, key="profit_step")
+            
+            with col2:
+                st.markdown("**Price Drop Threshold (Fixed %)**")
+                drop_threshold = st.number_input(
+                    "Threshold for Enhanced Buy", 
+                    min_value=0.1, 
+                    value=1.5, 
+                    step=0.1, 
+                    help="Price drop percentage that triggers enhanced buy amount"
+                )
+                
+                st.markdown("**Enhanced Buy Percentage (Fixed %)**")
+                extra_buy_pct = st.number_input(
+                    "Extra Buy Percentage", 
+                    min_value=0.0, 
+                    value=50.0, 
+                    step=10.0,
+                    help="Percentage increase to DCA amount when price drops significantly"
+                )
+                
+                st.markdown("**Stop Loss Percentage (Fixed %)**")
+                stop_loss_pct = st.number_input(
+                    "Stop Loss", 
+                    min_value=0.0, 
+                    value=10.0, 
+                    step=1.0,
+                    help="Maximum loss percentage before triggering a stop loss (0 to disable)"
+                )
+            
+        else:
+            # Standard parameters for other strategies
+            st.markdown("**Investment Amount (%)**")
+            inv_min = st.number_input("Min", min_value=0.1, value=5.0, step=0.1, key="inv_min")
+            inv_max = st.number_input("Max", min_value=0.1, value=25.0, step=0.1, key="inv_max")
+            inv_step = st.number_input("Step", min_value=0.1, value=5.0, step=0.1, key="inv_step")
+            
+            st.markdown("**Price Drop Threshold (%)**")
+            drop_min = st.number_input("Min", min_value=0.1, value=1.0, step=0.1, key="drop_min")
+            drop_max = st.number_input("Max", min_value=0.1, value=5.0, step=0.1, key="drop_max")
+            drop_step = st.number_input("Step", min_value=0.1, value=1.0, step=0.1, key="drop_step")
+            
+            st.markdown("**Profit Threshold (%)**")
+            profit_min = st.number_input("Min", min_value=0.1, value=1.0, step=0.1, key="profit_min")
+            profit_max = st.number_input("Max", min_value=0.1, value=5.0, step=0.1, key="profit_max")
+            profit_step = st.number_input("Step", min_value=0.1, value=1.0, step=0.1, key="profit_step")
+        
+        # Optimization metric
+        optimize_metric = st.selectbox(
+            "Optimization Metric",
+            options=["return_pct", "sharpe_ratio", "sortino_ratio", "outperformance", "win_rate"],
+            format_func=lambda x: {
+                "return_pct": "Total Return",
+                "sharpe_ratio": "Sharpe Ratio",
+                "sortino_ratio": "Sortino Ratio",
+                "outperformance": "Outperformance vs Buy & Hold",
+                "win_rate": "Win Rate"
+            }.get(x, x),
+            index=1
+        )
+        
+        # Use multiprocessing option
+        use_multiprocessing = st.checkbox("Use Multiprocessing", value=False, 
+                                        help="Enables parallel processing for faster optimization (Warning: may cause errors on some systems)")
+        
+        # Create a second form for running the optimization
+        run_optimization_button = st.form_submit_button("Run Optimization")
+        
+        # If the run button is clicked, we execute the optimization
+        if run_optimization_button:
+            # Store the fact that we're optimizing
+            st.session_state.is_optimizing = True
+            
+            # Limit parameter combinations if requested
+            if 'limit_param_combinations' not in st.session_state:
+                st.session_state.limit_param_combinations = True  # Default to limited combinations
+                
+            # Ask if user wants to limit combinations before continuing
+            limit_combinations = st.radio(
+                "Would you like to limit the combinations to make it run faster?",
+                ["Yes, limit to ~100 tests", "No, run all combinations"],
+                index=0
+            )
+            
+            if limit_combinations == "Yes, limit to ~100 tests":
+                st.session_state.limit_param_combinations = True
+            else:
+                st.session_state.limit_param_combinations = False
+
+# Main content area
+if st.session_state.selected_data is None:
+    st.warning("Please select a data file from the sidebar to begin.")
+else:
+    # Apply date filter if specified
+    df = st.session_state.selected_data
+    
+    try:
+        # Convert dates to timestamps for filtering
+        if 'start_date' in locals() and 'end_date' in locals():
+            mask = (df.index.date >= start_date) & (df.index.date <= end_date)
+            filtered_df = df.loc[mask]
+        else:
+            filtered_df = df
+            
+        if isinstance(filtered_df, pd.DataFrame) and filtered_df.empty:
+            st.error("No data in selected date range.")
+        else:
+            # Run optimization if button clicked
+            if run_optimization_button:
+                # Generate parameter grid
+                # Generate parameter grid - convert strategy type to format expected by optimizer
+                if strategy_type == "Alternative DCA":
+                    strategy_type_value = "Alternative DCA"
+                elif strategy_type == "Optimized Alternative DCA":
+                    strategy_type_value = "Optimized Alternative DCA"
+                elif strategy_type == "Optimized Alternative DCA v4":
+                    strategy_type_value = "Optimized Alternative DCA v4"
+                elif strategy_type == "Optimized Alternative DCA v5":
+                    strategy_type_value = "Optimized Alternative DCA v5"
+                elif strategy_type == "Optimized Alternative DCA v6":
+                    strategy_type_value = "Optimized Alternative DCA v6"
+                elif strategy_type == "Fixed Investment DCA":
+                    strategy_type_value = "Fixed Investment DCA"
+                elif strategy_type == "Liquidity-Managed DCA":
+                    strategy_type_value = "Liquidity-Managed DCA"
+                elif strategy_type == "Interval DCA":
+                    strategy_type_value = "Interval DCA"
+                else:
+                    strategy_type_value = "Original DCA"
+                    
+                # Set up different parameter grids depending on strategy type
+                if strategy_type_value == "Optimized Alternative DCA v6":
+                    param_grid = {
+                        'strategy_type': [strategy_type_value],
+                        'initial_capital': [initial_capital],
+                        'investment_pct': np.arange(inv_min, inv_max + inv_step/2, inv_step).tolist(),
+                        'price_drop_threshold': np.arange(drop_min, drop_max + drop_step/2, drop_step).tolist(),
+                        'profit_threshold': np.arange(profit_min, profit_max + profit_step/2, profit_step).tolist(),
+                        'trading_fee_pct': [trading_fee_pct],
+                        # Risk management parameters
+                        'stop_loss_fixed_pct': stop_loss_fixed_pct,
+                        'trailing_stop_pct': trailing_stop_pct,
+                        'max_position_duration': max_position_duration,
+                        # Advanced profit-taking parameters
+                        'partial_profit_taking': [partial_profit_taking],
+                        'profit_taking_percentage': [profit_taking_percentage],
+                        'use_trailing_stop_main': [use_trailing_stop_main],
+                        'trailing_stop_activation_pct': [trailing_stop_activation_pct],
+                        # Multi-bot parameters
+                        'number_of_bots': number_of_bots,  # Use the selected number of bots
+                        # Bot action interval
+                        'bot_action_interval': bot_action_intervals
+                    }
+                    
+                    # Handle uniform deployment days if enabled
+                    if uniform_deployment and uniform_deployment_days is not None and uniform_deployment_days > 0:
+                        param_grid['uniform_deployment_days'] = [uniform_deployment_days]
+                    
+                    # Only add dates/times if they're actually provided and not using uniform deployment
+                    if not uniform_deployment and bots_starting_dates is not None and len(bots_starting_dates) > 0:
+                        param_grid['bots_starting_dates'] = bots_starting_dates  # Custom distribution
+                    
+                    if not uniform_deployment and bots_starting_times is not None and len(bots_starting_times) > 0:
+                        param_grid['bots_starting_times'] = bots_starting_times  # Custom distribution
+                
+                elif strategy_type_value == "Optimized Alternative DCA v5":
+                    param_grid = {
+                        'strategy_type': [strategy_type_value],
+                        'initial_capital': [initial_capital],
+                        'investment_pct': np.arange(inv_min, inv_max + inv_step/2, inv_step).tolist(),
+                        'price_drop_threshold': np.arange(drop_min, drop_max + drop_step/2, drop_step).tolist(),
+                        'profit_threshold': np.arange(profit_min, profit_max + profit_step/2, profit_step).tolist(),
+                        'trading_fee_pct': [trading_fee_pct],
+                        # Risk management parameters
+                        'stop_loss_fixed_pct': stop_loss_fixed_pct,
+                        'trailing_stop_pct': trailing_stop_pct,
+                        'max_position_duration': max_position_duration,
+                        # Advanced profit-taking parameters
+                        'partial_profit_taking': [partial_profit_taking],
+                        'profit_taking_percentage': [profit_taking_percentage],
+                        'use_trailing_stop_main': [use_trailing_stop_main],
+                        'trailing_stop_activation_pct': [trailing_stop_activation_pct],
+                        # Multi-bot parameters
+                        'number_of_bots': number_of_bots  # Use the selected number of bots
+                    }
+                    
+                    # Handle uniform deployment days if enabled
+                    if uniform_deployment and uniform_deployment_days is not None and uniform_deployment_days > 0:
+                        param_grid['uniform_deployment_days'] = [uniform_deployment_days]
+                    
+                    # Only add dates/times if they're actually provided and not using uniform deployment
+                    if not uniform_deployment and bots_starting_dates is not None and len(bots_starting_dates) > 0:
+                        param_grid['bots_starting_dates'] = bots_starting_dates  # Custom distribution
+                    
+                    if not uniform_deployment and bots_starting_times is not None and len(bots_starting_times) > 0:
+                        param_grid['bots_starting_times'] = bots_starting_times  # Custom distribution
+                        
+                elif strategy_type_value == "Optimized Alternative DCA v4":
+                    param_grid = {
+                        'strategy_type': [strategy_type_value],
+                        'initial_capital': [initial_capital],
+                        'investment_pct': np.arange(inv_min, inv_max + inv_step/2, inv_step).tolist(),
+                        'price_drop_threshold': np.arange(drop_min, drop_max + drop_step/2, drop_step).tolist(),
+                        'profit_threshold': np.arange(profit_min, profit_max + profit_step/2, profit_step).tolist(),
+                        'trading_fee_pct': [trading_fee_pct],
+                        # Risk management parameters
+                        'stop_loss_fixed_pct': stop_loss_fixed_pct,
+                        'trailing_stop_pct': trailing_stop_pct,
+                        'max_position_duration': max_position_duration
+                    }
+                elif strategy_type_value == "Optimized Alternative DCA":
+                    param_grid = {
+                        'strategy_type': [strategy_type_value],
+                        'initial_capital': [initial_capital],
+                        'investment_pct': np.arange(inv_min, inv_max + inv_step/2, inv_step).tolist(),
+                        'price_drop_threshold': np.arange(drop_min, drop_max + drop_step/2, drop_step).tolist(),
+                        'profit_threshold': np.arange(profit_min, profit_max + profit_step/2, profit_step).tolist(),
+                        'trading_fee_pct': [trading_fee_pct],
+                        # Advanced parameters (now using lists from the form)
+                        'stop_loss_fixed_pct': stop_loss_fixed_pct,
+                        'atr_stop_multiplier': atr_stop_multiplier,
+                        'trailing_stop_pct': trailing_stop_pct,
+                        'max_position_duration': max_position_duration,
+                        'trend_filter_ma_period': trend_filter_ma_period,
+                        'volatility_atr_window': volatility_atr_window,
+                        'min_order_size': min_order_size,
+                        'order_aggregation_threshold': order_aggregation_threshold,
+                        'trailing_stop_activation_pct': trailing_stop_activation_pct
+                    }
+                elif strategy_type_value == "Liquidity-Managed DCA":
+                    param_grid = {
+                        'strategy_type': [strategy_type_value],
+                        'initial_capital': [initial_capital],
+                        'exit_profit_margin': np.arange(profit_min, profit_max + profit_step/2, profit_step).tolist(),
+                        'drop_threshold': np.arange(drop_min, drop_max + drop_step/2, drop_step).tolist(),
+                        'invest_increase': np.arange(invest_inc_min, invest_inc_max + invest_inc_step/2, invest_inc_step).tolist(),
+                        'invest_flat': [invest_flat],  # Value from input
+                        'invest_drop_significant': [invest_drop_sig],  # Value from input
+                        'invest_drop_non_significant': [invest_drop_non],  # Value from input
+                        'trading_fee_pct': [trading_fee_pct]
+                    }
+                elif strategy_type_value == "Interval DCA":
+                    param_grid = {
+                        'strategy_type': [strategy_type_value],
+                        'initial_capital': [initial_capital],
+                        'dca_amount': np.arange(dca_amount_min, dca_amount_max + dca_amount_step/2, dca_amount_step).tolist(),
+                        'interval_minutes': np.arange(interval_min, interval_max + interval_step/2, interval_step).tolist(),
+                        'profit_target': np.arange(profit_min, profit_max + profit_step/2, profit_step).tolist(),
+                        'drop_threshold': [drop_threshold],
+                        'extra_buy_pct': [extra_buy_pct],
+                        'stop_loss_pct': [stop_loss_pct],
+                        'trading_fee_pct': [trading_fee_pct]
+                    }
+                else:
+                    param_grid = {
+                        'strategy_type': [strategy_type_value],
+                        'initial_capital': [initial_capital],
+                        'investment_pct': np.arange(inv_min, inv_max + inv_step/2, inv_step).tolist(),
+                        'price_drop_threshold': np.arange(drop_min, drop_max + drop_step/2, drop_step).tolist(),
+                        'profit_threshold': np.arange(profit_min, profit_max + profit_step/2, profit_step).tolist(),
+                        'trading_fee_pct': [trading_fee_pct]
+                    }
+                
+                # Calculate total combinations based on strategy type
+                if strategy_type_value == "Optimized Alternative DCA v6":
+                    # Base combinations of core parameters
+                    base_combinations = (
+                        len(param_grid['investment_pct']) * 
+                        len(param_grid['price_drop_threshold']) * 
+                        len(param_grid['profit_threshold'])
+                    )
+                    
+                    # Risk management parameter combinations
+                    risk_combinations = 1
+                    if 'stop_loss_fixed_pct' in param_grid and len(param_grid['stop_loss_fixed_pct']) > 1:
+                        risk_combinations *= len(param_grid['stop_loss_fixed_pct'])
+                    if 'trailing_stop_pct' in param_grid and len(param_grid['trailing_stop_pct']) > 1:
+                        risk_combinations *= len(param_grid['trailing_stop_pct'])
+                    if 'max_position_duration' in param_grid and len(param_grid['max_position_duration']) > 1:
+                        risk_combinations *= len(param_grid['max_position_duration'])
+                    
+                    # Advanced profit-taking parameters
+                    profit_combinations = 1
+                    if 'trailing_stop_activation_pct' in param_grid and len(param_grid['trailing_stop_activation_pct']) > 1:
+                        profit_combinations *= len(param_grid['trailing_stop_activation_pct'])
+                    if 'use_trailing_stop_main' in param_grid and len(param_grid['use_trailing_stop_main']) > 1:
+                        profit_combinations *= len(param_grid['use_trailing_stop_main'])
+                    if 'partial_profit_taking' in param_grid and len(param_grid['partial_profit_taking']) > 1:
+                        profit_combinations *= len(param_grid['partial_profit_taking'])
+                    if 'profit_taking_percentage' in param_grid and len(param_grid['profit_taking_percentage']) > 1:
+                        profit_combinations *= len(param_grid['profit_taking_percentage'])
+                    
+                    # Multi-bot parameter combinations
+                    multi_bot_combinations = 1
+                    if 'number_of_bots' in param_grid and len(param_grid['number_of_bots']) > 1:
+                        multi_bot_combinations *= len(param_grid['number_of_bots'])
+                    
+                    # Bot action interval combinations
+                    interval_combinations = 1
+                    if 'bot_action_interval' in param_grid and len(param_grid['bot_action_interval']) > 1:
+                        interval_combinations *= len(param_grid['bot_action_interval'])
+                        
+                    total_combinations = base_combinations * risk_combinations * profit_combinations * multi_bot_combinations * interval_combinations
+                
+                elif strategy_type_value == "Liquidity-Managed DCA":
+                    total_combinations = (
+                        len(param_grid['invest_increase']) * 
+                        len(param_grid['drop_threshold']) * 
+                        len(param_grid['exit_profit_margin'])
+                    )
+                elif strategy_type_value == "Interval DCA":
+                    total_combinations = (
+                        len(param_grid['dca_amount']) * 
+                        len(param_grid['interval_minutes']) * 
+                        len(param_grid['profit_target'])
+                    )
+                elif strategy_type_value == "Optimized Alternative DCA v5":
+                    # Base combinations of core parameters
+                    base_combinations = (
+                        len(param_grid['investment_pct']) * 
+                        len(param_grid['price_drop_threshold']) * 
+                        len(param_grid['profit_threshold'])
+                    )
+                    
+                    # Risk management parameter combinations
+                    risk_combinations = 1
+                    if 'stop_loss_fixed_pct' in param_grid and len(param_grid['stop_loss_fixed_pct']) > 1:
+                        risk_combinations *= len(param_grid['stop_loss_fixed_pct'])
+                    if 'trailing_stop_pct' in param_grid and len(param_grid['trailing_stop_pct']) > 1:
+                        risk_combinations *= len(param_grid['trailing_stop_pct'])
+                    if 'max_position_duration' in param_grid and len(param_grid['max_position_duration']) > 1:
+                        risk_combinations *= len(param_grid['max_position_duration'])
+                    
+                    # Advanced profit-taking parameters
+                    if 'trailing_stop_activation_pct' in param_grid and len(param_grid['trailing_stop_activation_pct']) > 1:
+                        risk_combinations *= len(param_grid['trailing_stop_activation_pct'])
+                    if 'use_trailing_stop_main' in param_grid and len(param_grid['use_trailing_stop_main']) > 1:
+                        risk_combinations *= len(param_grid['use_trailing_stop_main'])
+                    if 'partial_profit_taking' in param_grid and len(param_grid['partial_profit_taking']) > 1:
+                        risk_combinations *= len(param_grid['partial_profit_taking'])
+                    if 'profit_taking_percentage' in param_grid and len(param_grid['profit_taking_percentage']) > 1:
+                        risk_combinations *= len(param_grid['profit_taking_percentage'])
+                    
+                    # Multi-bot parameter combinations
+                    multi_bot_combinations = 1
+                    if 'number_of_bots' in param_grid and len(param_grid['number_of_bots']) > 1:
+                        multi_bot_combinations *= len(param_grid['number_of_bots'])
+                        
+                    total_combinations = base_combinations * risk_combinations * multi_bot_combinations
+                    
+                elif strategy_type_value == "Optimized Alternative DCA v4":
+                    # Base combinations of core parameters
+                    base_combinations = (
+                        len(param_grid['investment_pct']) * 
+                        len(param_grid['price_drop_threshold']) * 
+                        len(param_grid['profit_threshold'])
+                    )
+                    
+                    # Risk management parameter combinations
+                    risk_combinations = 1
+                    if 'stop_loss_fixed_pct' in param_grid and len(param_grid['stop_loss_fixed_pct']) > 1:
+                        risk_combinations *= len(param_grid['stop_loss_fixed_pct'])
+                    if 'trailing_stop_pct' in param_grid and len(param_grid['trailing_stop_pct']) > 1:
+                        risk_combinations *= len(param_grid['trailing_stop_pct'])
+                    if 'max_position_duration' in param_grid and len(param_grid['max_position_duration']) > 1:
+                        risk_combinations *= len(param_grid['max_position_duration'])
+                    
+                    total_combinations = base_combinations * risk_combinations
+                elif strategy_type_value == "Optimized Alternative DCA":
+                    # Base combinations of core parameters
+                    base_combinations = (
+                        len(param_grid['investment_pct']) * 
+                        len(param_grid['price_drop_threshold']) * 
+                        len(param_grid['profit_threshold'])
+                    )
+                    
+                    # Advanced parameter combinations
+                    advanced_combinations = 1
+                    # Make sure all required parameters exist in the param_grid
+                    required_params = ['stop_loss_fixed_pct', 'atr_stop_multiplier', 'trailing_stop_pct', 
+                                     'max_position_duration', 'trend_filter_ma_period', 
+                                     'volatility_atr_window', 'min_order_size', 
+                                     'order_aggregation_threshold', 'trailing_stop_activation_pct']
+                    
+                    # Add any missing parameters with default values
+                    for param in required_params:
+                        if param not in param_grid:
+                            if param == 'stop_loss_fixed_pct':
+                                param_grid[param] = [15.0]
+                            elif param == 'atr_stop_multiplier':
+                                param_grid[param] = [3.0]
+                            elif param == 'trailing_stop_pct':
+                                param_grid[param] = [1.5]
+                            elif param == 'max_position_duration':
+                                param_grid[param] = [180]
+                            elif param == 'trend_filter_ma_period':
+                                param_grid[param] = [50]
+                            elif param == 'volatility_atr_window':
+                                param_grid[param] = [14]
+                            elif param == 'min_order_size':
+                                param_grid[param] = [50.0]
+                            elif param == 'order_aggregation_threshold':
+                                param_grid[param] = [2.0]
+                            elif param == 'trailing_stop_activation_pct':
+                                param_grid[param] = [1.5]
+                    
+                    # Now calculate the advanced combinations safely
+                    if 'stop_loss_fixed_pct' in param_grid and len(param_grid['stop_loss_fixed_pct']) > 1:
+                        advanced_combinations *= len(param_grid['stop_loss_fixed_pct'])
+                    if 'atr_stop_multiplier' in param_grid and len(param_grid['atr_stop_multiplier']) > 1:
+                        advanced_combinations *= len(param_grid['atr_stop_multiplier'])
+                    if 'trailing_stop_pct' in param_grid and len(param_grid['trailing_stop_pct']) > 1:
+                        advanced_combinations *= len(param_grid['trailing_stop_pct'])
+                    if 'trend_filter_ma_period' in param_grid and len(param_grid['trend_filter_ma_period']) > 1:
+                        advanced_combinations *= len(param_grid['trend_filter_ma_period'])
+                    if 'min_order_size' in param_grid and len(param_grid['min_order_size']) > 1:
+                        advanced_combinations *= len(param_grid['min_order_size'])
+                    if 'trailing_stop_activation_pct' in param_grid and len(param_grid['trailing_stop_activation_pct']) > 1:
+                        advanced_combinations *= len(param_grid['trailing_stop_activation_pct'])
+                    
+                    total_combinations = base_combinations * advanced_combinations
+                else:
+                    total_combinations = (
+                        len(param_grid['investment_pct']) * 
+                        len(param_grid['price_drop_threshold']) * 
+                        len(param_grid['profit_threshold'])
+                    )
+                
+                # Warn if too many combinations but don't use radio buttons (they break form submission)
+                if total_combinations > 200:
+                    st.warning(f"This will test {total_combinations} parameter combinations, which may take a long time.")
+                    
+                    # Ask user if they want to reduce combinations
+                    auto_reduce = st.checkbox(
+                        "Automatically reduce parameter combinations for faster optimization", 
+                        value=False,
+                        help="If checked, the system will reduce the number of combinations to test by sampling key values instead of testing every value in the ranges you specified."
+                    )
+                    
+                    if auto_reduce:
+                        # Store original parameter grid before reduction
+                        original_param_grid = param_grid.copy()
+                        
+                        # Show message about reduction
+                        st.success("Reducing parameter combinations for faster optimization...")
+                        
+                        # Reduce the step size for main parameters to limit combinations
+                        if len(param_grid['investment_pct']) > 3:
+                            param_grid['investment_pct'] = [param_grid['investment_pct'][0], 
+                                                           (param_grid['investment_pct'][0] + param_grid['investment_pct'][-1])/2, 
+                                                           param_grid['investment_pct'][-1]]
+                        
+                        if len(param_grid['price_drop_threshold']) > 3:
+                            param_grid['price_drop_threshold'] = [param_grid['price_drop_threshold'][0], 
+                                                                 (param_grid['price_drop_threshold'][0] + param_grid['price_drop_threshold'][-1])/2,
+                                                                 param_grid['price_drop_threshold'][-1]]
+                        
+                        if len(param_grid['profit_threshold']) > 3:
+                            param_grid['profit_threshold'] = [param_grid['profit_threshold'][0], 
+                                                            (param_grid['profit_threshold'][0] + param_grid['profit_threshold'][-1])/2,
+                                                            param_grid['profit_threshold'][-1]]
+                        
+                    # Only simplify advanced parameters if auto_reduce is enabled
+                    if auto_reduce and strategy_type_value == "Optimized Alternative DCA v6" and 'stop_loss_fixed_pct' in param_grid:
+                        # Show message about reducing V6 parameters
+                        st.info("Reducing V6 strategy advanced parameters for faster optimization")
+                        
+                        # Just use the min for advanced parameters
+                        for param in ['stop_loss_fixed_pct', 'trailing_stop_pct']:
+                            if param in param_grid and len(param_grid[param]) > 1:
+                                param_grid[param] = [param_grid[param][0]]
+                        
+                        # For multi-bot parameters, respect user choice for number of bots
+                        param_grid['max_position_duration'] = [180]
+                        
+                        # If optimizing number of bots, keep that optimization
+                        if len(param_grid['number_of_bots']) > 1:
+                            # Keep only min and max values to reduce combinations
+                            param_grid['number_of_bots'] = [param_grid['number_of_bots'][0], param_grid['number_of_bots'][-1]]
+                        
+                        # For bot action intervals, limit to fewer values
+                        if 'bot_action_interval' in param_grid and len(param_grid['bot_action_interval']) > 1:
+                            param_grid['bot_action_interval'] = [param_grid['bot_action_interval'][0], param_grid['bot_action_interval'][-1]]
+                        
+                        # Simplify date/time settings to reduce combinations
+                        if param_grid.get('bots_starting_dates') and len(param_grid['bots_starting_dates']) > 0:
+                            param_grid['bots_starting_dates'] = [param_grid['bots_starting_dates'][0]]
+                        else:
+                            param_grid['bots_starting_dates'] = None
+                            
+                        if param_grid.get('bots_starting_times') and len(param_grid['bots_starting_times']) > 0:
+                            param_grid['bots_starting_times'] = [param_grid['bots_starting_times'][0]]
+                        else:
+                            param_grid['bots_starting_times'] = None
+                        
+                    elif strategy_type_value == "Optimized Alternative DCA v5" and 'stop_loss_fixed_pct' in param_grid:
+                        # Just use the min for advanced parameters
+                        for param in ['stop_loss_fixed_pct', 'trailing_stop_pct']:
+                            if param in param_grid and len(param_grid[param]) > 1:
+                                param_grid[param] = [param_grid[param][0]]
+                        
+                        # For multi-bot parameters, respect user choice for number of bots
+                        param_grid['max_position_duration'] = [180]
+                        
+                        # If optimizing number of bots, keep that optimization
+                        if len(param_grid['number_of_bots']) > 1:
+                            # Keep only min and max values to reduce combinations
+                            param_grid['number_of_bots'] = [param_grid['number_of_bots'][0], param_grid['number_of_bots'][-1]]
+                        
+                        # Simplify date/time settings to reduce combinations
+                        if param_grid.get('bots_starting_dates') and len(param_grid['bots_starting_dates']) > 0:
+                            param_grid['bots_starting_dates'] = [param_grid['bots_starting_dates'][0]]
+                        else:
+                            param_grid['bots_starting_dates'] = None
+                            
+                        if param_grid.get('bots_starting_times') and len(param_grid['bots_starting_times']) > 0:
+                            param_grid['bots_starting_times'] = [param_grid['bots_starting_times'][0]]
+                        else:
+                            param_grid['bots_starting_times'] = None
+                        
+                    elif strategy_type_value == "Optimized Alternative DCA" and 'stop_loss_fixed_pct' in param_grid:
+                        # Just use the min for advanced parameters
+                        for param in ['stop_loss_fixed_pct', 'atr_stop_multiplier', 'trailing_stop_pct', 
+                                     'trend_filter_ma_period', 'min_order_size', 'trailing_stop_activation_pct']:
+                            if param in param_grid and len(param_grid[param]) > 1:
+                                param_grid[param] = [param_grid[param][0]]
+                        
+                        # Fixed values for less critical parameters
+                        param_grid['max_position_duration'] = [180]
+                        param_grid['volatility_atr_window'] = [14]
+                        param_grid['order_aggregation_threshold'] = [2.0]
+                    
+                    # Recalculate total combinations
+                    if strategy_type_value == "Optimized Alternative DCA v6" and 'stop_loss_fixed_pct' in param_grid:
+                        # Calculate with multi-bot parameters and bot action intervals
+                        base_combinations = (
+                            len(param_grid['investment_pct']) * 
+                            len(param_grid['price_drop_threshold']) * 
+                            len(param_grid['profit_threshold'])
+                        )
+                        risk_combinations = (
+                            len(param_grid['stop_loss_fixed_pct']) * 
+                            len(param_grid['trailing_stop_pct']) * 
+                            len(param_grid['max_position_duration'])
+                        )
+                        profit_combinations = (
+                            1 if 'partial_profit_taking' not in param_grid else len(param_grid['partial_profit_taking'])
+                        ) * (
+                            1 if 'profit_taking_percentage' not in param_grid else len(param_grid['profit_taking_percentage'])
+                        ) * (
+                            1 if 'use_trailing_stop_main' not in param_grid else len(param_grid['use_trailing_stop_main'])
+                        ) * (
+                            1 if 'trailing_stop_activation_pct' not in param_grid else len(param_grid['trailing_stop_activation_pct'])
+                        )
+                        multi_bot_combinations = len(param_grid['number_of_bots'])
+                        interval_combinations = 1
+                        if 'bot_action_interval' in param_grid:
+                            interval_combinations = len(param_grid['bot_action_interval'])
+                        
+                        total_combinations = base_combinations * risk_combinations * profit_combinations * multi_bot_combinations * interval_combinations
+                    
+                    elif strategy_type_value == "Optimized Alternative DCA v5" and 'stop_loss_fixed_pct' in param_grid:
+                        # Calculate with multi-bot parameters
+                        base_combinations = (
+                            len(param_grid['investment_pct']) * 
+                            len(param_grid['price_drop_threshold']) * 
+                            len(param_grid['profit_threshold'])
+                        )
+                        risk_combinations = (
+                            len(param_grid['stop_loss_fixed_pct']) * 
+                            len(param_grid['trailing_stop_pct']) * 
+                            len(param_grid['max_position_duration'])
+                        )
+                        multi_bot_combinations = len(param_grid['number_of_bots'])
+                        total_combinations = base_combinations * risk_combinations * multi_bot_combinations
+                        
+                    elif strategy_type_value == "Optimized Alternative DCA" and 'stop_loss_fixed_pct' in param_grid:
+                        # Calculate with advanced parameters
+                        base_combinations = (
+                            len(param_grid['investment_pct']) * 
+                            len(param_grid['price_drop_threshold']) * 
+                            len(param_grid['profit_threshold'])
+                        )
+                        advanced_combinations = (
+                            len(param_grid['stop_loss_fixed_pct']) * 
+                            len(param_grid['atr_stop_multiplier']) * 
+                            len(param_grid['trailing_stop_pct']) * 
+                            len(param_grid['trend_filter_ma_period']) * 
+                            len(param_grid['min_order_size']) * 
+                            len(param_grid['trailing_stop_activation_pct'])
+                        )
+                        total_combinations = base_combinations * advanced_combinations
+                    else:
+                        # Calculate without advanced parameters
+                        base_combinations = (
+                            len(param_grid['investment_pct']) * 
+                            len(param_grid['price_drop_threshold']) * 
+                            len(param_grid['profit_threshold'])
+                        )
+                        total_combinations = base_combinations
+                    
+                    st.info(f"Reduced to {total_combinations} parameter combinations")
+                
+                # For very large combinations, ask user if they want to reduce combinations
+                if total_combinations > 1000:
+                    st.warning(f"This will test {total_combinations} parameter combinations, which may take a very long time.")
+                    reduce_combinations = st.radio(
+                        "Would you like to reduce the number of combinations?",
+                        ["No, use my exact parameter settings", "Yes, reduce combinations for faster results"],
+                        index=1
+                    )
+                    
+                    if reduce_combinations == "Yes, reduce combinations for faster results":
+                        # Store original parameter grid before reduction
+                        original_param_grid = param_grid.copy()
+                        
+                        # Show message about reduction
+                        st.success("Reducing parameter combinations for faster optimization...")
+                        
+                        # Reduce the step size for main parameters to limit combinations
+                        if len(param_grid['investment_pct']) > 3:
+                            param_grid['investment_pct'] = [param_grid['investment_pct'][0], 
+                                                           (param_grid['investment_pct'][0] + param_grid['investment_pct'][-1])/2, 
+                                                           param_grid['investment_pct'][-1]]
+                        
+                        if len(param_grid['price_drop_threshold']) > 3:
+                            param_grid['price_drop_threshold'] = [param_grid['price_drop_threshold'][0], 
+                                                                 (param_grid['price_drop_threshold'][0] + param_grid['price_drop_threshold'][-1])/2,
+                                                                 param_grid['price_drop_threshold'][-1]]
+                        
+                        if len(param_grid['profit_threshold']) > 3:
+                            param_grid['profit_threshold'] = [param_grid['profit_threshold'][0], 
+                                                            (param_grid['profit_threshold'][0] + param_grid['profit_threshold'][-1])/2,
+                                                            param_grid['profit_threshold'][-1]]
+                            
+                        # For advanced parameters, reduce but don't eliminate the variations, only if auto_reduce is enabled
+                        if auto_reduce and strategy_type_value == "Optimized Alternative DCA v6" and 'stop_loss_fixed_pct' in param_grid:
+                            st.info("Reducing parameter space for faster optimization - preserving min/max values")
+                            # Reduce advanced parameter combinations but keep the user's min/max values
+                            for param in ['stop_loss_fixed_pct', 'trailing_stop_pct']:
+                                if param in param_grid and len(param_grid[param]) > 3:
+                                    param_grid[param] = [param_grid[param][0], param_grid[param][-1]]
+                            
+                            # If optimizing number of bots, keep that optimization with reduced values
+                            if 'number_of_bots' in param_grid and len(param_grid['number_of_bots']) > 3:
+                                param_grid['number_of_bots'] = [param_grid['number_of_bots'][0], param_grid['number_of_bots'][-1]]
+                            
+                            # For bot action intervals, limit to fewer values but preserve user range
+                            if 'bot_action_interval' in param_grid and len(param_grid['bot_action_interval']) > 3:
+                                param_grid['bot_action_interval'] = [param_grid['bot_action_interval'][0], param_grid['bot_action_interval'][-1]]
+                        
+                        # Calculate reduced combinations
+                        reduced_combinations = 1
+                        for param, values in param_grid.items():
+                            if isinstance(values, list) and param != 'strategy_type':
+                                reduced_combinations *= len(values)
+                        
+                        st.info(f"Reduced parameter combinations from {total_combinations} to {reduced_combinations}")
+                        total_combinations = reduced_combinations
+                
+                # Create optimizer
+                optimizer = ParameterOptimizer(data=filtered_df)
+                
+                # Create containers for progress display
+                progress_header = st.empty()
+                progress_header.markdown(f"### 📊 Optimization Progress (preparing...)")
+                progress_container = st.container()
+                with progress_container:
+                    col1, col2 = st.columns([1, 3])
+                    with col1:
+                        progress_percentage = st.empty()
+                    with col2:
+                        progress_bar = st.progress(0)
+                
+                status_text = st.empty()
+                
+                # Add enhanced custom CSS for better visibility of progress and results
+                st.markdown("""
+                <style>
+                /* Progress bar enhancements */
+                .stProgress > div > div > div {
+                    height: 25px !important;
+                    background-color: #1E88E5 !important;
+                    transition: width 0.5s ease !important;
+                }
+                
+                .stProgress {
+                    margin-bottom: 20px !important;
+                }
+                
+                /* Make progress bar more visible with higher z-index */
+                div[data-testid="stVerticalBlock"] div[data-testid="stProgress"] {
+                    z-index: 999 !important;
+                }
+                
+                /* Results cards styling */
+                .test-result-card {
+                    background-color: #f8f9fa;
+                    border-radius: 10px;
+                    padding: 15px;
+                    margin-bottom: 15px;
+                    border-left: 5px solid #4CAF50;
+                    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+                    transition: transform 0.2s ease, box-shadow 0.2s ease;
+                    position: relative;
+                }
+                
+                .test-result-card:hover {
+                    transform: translateY(-2px);
+                    box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+                }
+                
+                .test-result-positive {
+                    border-left: 5px solid #4CAF50;
+                    background-color: #e8f5e9;
+                }
+                
+                .test-result-negative {
+                    border-left: 5px solid #f44336;
+                    background-color: #ffebee;
+                }
+                
+                .test-result-neutral {
+                    border-left: 5px solid #2196F3;
+                    background-color: #e3f2fd;
+                }
+                
+                .params-text {
+                    font-size: 1.0em;
+                    color: #333;
+                    margin-bottom: 8px;
+                }
+                
+                .result-value {
+                    font-size: 1.2em;
+                    font-weight: bold;
+                    margin-top: 8px;
+                    color: #1a237e;
+                }
+                
+                .test-time {
+                    font-size: 0.8em;
+                    color: #666;
+                    position: absolute;
+                    top: 10px;
+                    right: 12px;
+                    background: rgba(255,255,255,0.8);
+                    padding: 2px 6px;
+                    border-radius: 4px;
+                }
+                
+                .progress-text {
+                    font-size: 2.2em;
+                    font-weight: bold;
+                    text-align: center;
+                    color: #1E88E5;
+                    margin-bottom: 0;
+                    text-shadow: 0 1px 1px rgba(0,0,0,0.1);
+                }
+                
+                .optimization-counter {
+                    background-color: #f5f7fa;
+                    border-radius: 10px;
+                    padding: 15px;
+                    margin-bottom: 15px;
+                    text-align: center;
+                    border: 1px solid #e0e6ed;
+                    box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+                }
+                
+                .optimization-counter-text {
+                    font-size: 1.3em;
+                    font-weight: bold;
+                    margin-bottom: 0;
+                    color: #37474F;
+                }
+                
+                .best-result-card {
+                    background-color: #e3f2fd;
+                    border-radius: 10px;
+                    padding: 18px;
+                    margin-top: 20px;
+                    margin-bottom: 20px;
+                    border-left: 5px solid #1E88E5;
+                    box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+                }
+                
+                .best-result-card h4 {
+                    margin-top: 0;
+                    color: #1565C0;
+                    font-size: 18px;
+                }
+                </style>
+                """, unsafe_allow_html=True)
+                
+                # Create containers for live progress updates
+                st.markdown("### 🧪 Optimization Progress & Results")
+                
+                # Container for current test information
+                current_test_info = st.container()  
+                with current_test_info:
+                    st.markdown("""
+                    <div style="padding: 10px; border-radius: 8px; background-color: #e3f2fd; margin-bottom: 20px;">
+                        <h4 style="margin-top: 0;">⏳ Current Test</h4>
+                        <div id="current-test-details">Waiting to start...</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # Results summary container
+                results_summary = st.container()
+                
+                # Container for the latest best result
+                best_result_container = st.empty()
+                
+                # Reset completed tests list and initialize tracking variables
+                st.session_state.completed_tests = []
+                if 'best_score' not in st.session_state:
+                    st.session_state.best_score = -float('inf')
+                    st.session_state.best_params_display = {}
+                
+                # Define progress callback function
+                def update_progress(percent, message):
+                    # Force the update to the UI
+                    st.session_state.current_progress = percent
+                    
+                    # Log progress to console for debugging
+                    print(f"Optimization progress: {percent}% - {message}")
+                    
+                    # Update progress display
+                    progress_header.markdown(f"### 📊 Optimization Progress ({total_combinations} combinations)")
+                    progress_percentage.markdown(f'<p class="progress-text">{percent:.0f}%</p>', unsafe_allow_html=True)
+                    progress_bar.progress(percent / 100)
+                    status_text.text(message)
+                    
+                    # Parse the current test information and update UI
+                    try:
+                        # Extract current test info from the message
+                        if "test completed" in message.lower():
+                            parts = message.split("test completed")[0].strip()
+                            
+                            # Check for different strategy test results with regex
+                            liquidity_match = re.search(r"Test with Invest Inc: (\d+\.?\d*)%, Drop: (\d+\.?\d*)%, Profit: (\d+\.?\d*)% - ([0-9.-]+) (\w+)", parts)
+                            standard_match = re.search(r"Test with Investment: (\d+\.?\d*)%, Drop: (\d+\.?\d*)%, Profit: (\d+\.?\d*)% - ([0-9.-]+) (\w+)", parts)
+                            interval_match = re.search(r"Test with DCA Amount: (\d+\.?\d*), Interval: (\d+) min, Profit Target: (\d+\.?\d*)% - ([0-9.-]+) (\w+)", parts)
+                            optimized_match = re.search(r"Test with Optimized Alternative DCA - Invest: (\d+\.?\d*)%, Drop: (\d+\.?\d*)%, Profit: (\d+\.?\d*)% - ([0-9.-]+) (\w+)", parts)
+                            optimized_v5_match = re.search(r"Test with Optimized Alternative DCA v5 - Invest: (\d+\.?\d*)%, Drop: (\d+\.?\d*)%, Profit: (\d+\.?\d*)%, Stop: (\d+\.?\d*)%, Trail: (\d+\.?\d*)%(.*?) - ([0-9.-]+) (\w+)", parts)
+                            
+                            if not interval_match:
+                                # Try alternate format
+                                interval_match = re.search(r"Test with Interval DCA - Amount: (\d+\.?\d*), Interval: (\d+) min, Profit: (\d+\.?\d*)% - ([0-9.-]+) (\w+)", parts)
+                            
+                            # Process the match if found
+                            if not liquidity_match and not standard_match and not interval_match and not optimized_match and not optimized_v5_match:
+                                # No match found
+                                print(f"Couldn't parse message: {message}")
+                                return  # Exit the callback function
+                                
+                            if liquidity_match:
+                                # Parse Liquidity-Managed DCA parameters
+                                is_liquidity_strategy = True
+                                is_interval_strategy = False
+                                invest_increase = float(liquidity_match.group(1))
+                                drop_threshold = float(liquidity_match.group(2)) 
+                                exit_profit_margin = float(liquidity_match.group(3))
+                                metric_value = float(liquidity_match.group(4))
+                                metric_name = liquidity_match.group(5)
+                                
+                                # For display
+                                investment_pct = invest_increase  # Reuse variable name
+                                price_drop = drop_threshold
+                                profit_threshold = exit_profit_margin
+                                
+                                params_text = f"Investment: {investment_pct}%, Drop: {price_drop}%, Profit: {profit_threshold}%"
+                            elif interval_match:
+                                # Parse Interval DCA parameters
+                                is_liquidity_strategy = False
+                                is_interval_strategy = True
+                                dca_amount = float(interval_match.group(1))
+                                interval_minutes = int(interval_match.group(2))
+                                profit_target = float(interval_match.group(3))
+                                metric_value = float(interval_match.group(4))
+                                metric_name = interval_match.group(5)
+                                
+                                # For display 
+                                investment_pct = dca_amount  # Not a percentage but amount
+                                price_drop = interval_minutes  # Not a percentage but minutes
+                                profit_threshold = profit_target
+                                
+                                params_text = f"DCA: ${investment_pct}, Interval: {price_drop}min, Profit: {profit_threshold}%"
+                            elif optimized_v5_match:
+                                # Parse Optimized Alternative DCA v5 parameters
+                                is_liquidity_strategy = False
+                                is_interval_strategy = False
+                                investment_pct = float(optimized_v5_match.group(1))
+                                price_drop = float(optimized_v5_match.group(2)) 
+                                profit_threshold = float(optimized_v5_match.group(3))
+                                stop_loss = float(optimized_v5_match.group(4))
+                                trailing_stop = float(optimized_v5_match.group(5))
+                                bots_info = optimized_v5_match.group(6).strip()
+                                metric_value = float(optimized_v5_match.group(7))
+                                metric_name = optimized_v5_match.group(8)
+                                
+                                # For display
+                                params_text = f"Investment: {investment_pct}%, Drop: {price_drop}%, Profit: {profit_threshold}%, Stop: {stop_loss}%, Trail: {trailing_stop}%{' ' + bots_info if bots_info else ''}"
+                            elif optimized_match:
+                                # Parse Optimized Alternative DCA parameters
+                                is_liquidity_strategy = False
+                                is_interval_strategy = False
+                                investment_pct = float(optimized_match.group(1))
+                                price_drop = float(optimized_match.group(2)) 
+                                profit_threshold = float(optimized_match.group(3))
+                                metric_value = float(optimized_match.group(4))
+                                metric_name = optimized_match.group(5)
+                                
+                                params_text = f"Investment: {investment_pct}%, Drop: {price_drop}%, Profit: {profit_threshold}%"
+                            else:  # Must be standard_match
+                                # Parse standard strategy parameters
+                                is_liquidity_strategy = False
+                                is_interval_strategy = False
+                                investment_pct = float(standard_match.group(1))
+                                price_drop = float(standard_match.group(2)) 
+                                profit_threshold = float(standard_match.group(3))
+                                metric_value = float(standard_match.group(4))
+                                metric_name = standard_match.group(5)
+                                
+                                params_text = f"Investment: {investment_pct}%, Drop: {price_drop}%, Profit: {profit_threshold}%"
+                            
+                            # Update the current test information display
+                            test_result_color = "#4CAF50" if metric_value > 0 else "#f44336" if metric_value < 0 else "#2196F3"
+                            
+                            with current_test_info:
+                                if is_interval_strategy:
+                                    st.markdown(f"""
+                                    <div style="padding: 10px; border-radius: 8px; background-color: #e3f2fd; margin-bottom: 20px; 
+                                        border-left: 5px solid {test_result_color};">
+                                        <h4 style="margin-top: 0;">⏳ Latest Test Completed ({percent:.0f}%)</h4>
+                                        <p><strong>Parameters:</strong> {params_text}</p>
+                                        <p><strong>Result:</strong> {metric_name} = <span style="color: {test_result_color}; font-weight: bold;">
+                                            {metric_value:.3f}</span></p>
+                                        <p style="margin-bottom: 0;"><strong>Progress:</strong> Test {len(st.session_state.completed_tests) + 1} of {total_combinations}</p>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                else:
+                                    st.markdown(f"""
+                                    <div style="padding: 10px; border-radius: 8px; background-color: #e3f2fd; margin-bottom: 20px; 
+                                        border-left: 5px solid {test_result_color};">
+                                        <h4 style="margin-top: 0;">⏳ Latest Test Completed ({percent:.0f}%)</h4>
+                                        <p><strong>Parameters:</strong> Investment: {investment_pct}%, 
+                                            Drop: {price_drop}%, Profit: {profit_threshold}%</p>
+                                        <p><strong>Result:</strong> {metric_name} = <span style="color: {test_result_color}; font-weight: bold;">
+                                            {metric_value:.3f}</span></p>
+                                        <p style="margin-bottom: 0;"><strong>Progress:</strong> Test {len(st.session_state.completed_tests) + 1} of {total_combinations}</p>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                
+                                # Determine result category based on metric value
+                                card_class = "test-result-neutral"
+                                if metric_value is not None:
+                                    if metric_value > 0:
+                                        card_class = "test-result-positive"
+                                    elif metric_value < 0:
+                                        card_class = "test-result-negative"
+                                    
+                                    # Check if this is the best result so far
+                                    if optimize_metric in ["return_pct", "sharpe_ratio", "sortino_ratio", "outperformance", "win_rate"]:
+                                        if metric_value > st.session_state.best_score:
+                                            st.session_state.best_score = metric_value
+                                            
+                                            # Update display parameters based on the strategy type
+                                            if 'optimized_v5_match' in locals() and optimized_v5_match:
+                                                st.session_state.best_params_display = {
+                                                    "investment_pct": investment_pct,
+                                                    "price_drop": price_drop,
+                                                    "profit_threshold": profit_threshold,
+                                                    "stop_loss": stop_loss,
+                                                    "trailing_stop": trailing_stop,
+                                                    "bots_info": bots_info if bots_info else "",
+                                                    "metric_value": metric_value,
+                                                    "metric_name": optimize_metric,
+                                                    "is_v5": True
+                                                }
+                                            else:
+                                                st.session_state.best_params_display = {
+                                                    "investment_pct": investment_pct,
+                                                    "price_drop": price_drop,
+                                                    "profit_threshold": profit_threshold,
+                                                    "metric_value": metric_value,
+                                                    "metric_name": optimize_metric,
+                                                    "is_v5": False
+                                                }
+                                
+                                # Add to completed tests
+                                st.session_state.completed_tests.append({
+                                    "time": datetime.now().strftime("%H:%M:%S"),
+                                    "parameters": params_text,
+                                    "metric_value": metric_value,
+                                    "card_class": card_class,
+                                    "progress": f"{percent:.1f}%"
+                                })
+                    except Exception as e:
+                        print(f"Error processing test result: {e}")
+                        # Still add something to the list even if parsing fails
+                        st.session_state.completed_tests.append({
+                            "time": datetime.now().strftime("%H:%M:%S"),
+                            "parameters": message,
+                            "metric_value": None,
+                            "card_class": "test-result-neutral",
+                            "progress": f"{percent:.1f}%"
+                        })
+                    
+                    # Only update the UI elements outside the callback to avoid race conditions
+                    if len(st.session_state.completed_tests) > 0:
+                        # Update the results summary
+                        with results_summary:
+                            total_tests = len(st.session_state.completed_tests)
+                            positive_tests = sum(1 for test in st.session_state.completed_tests 
+                                            if test.get("metric_value", 0) is not None and test.get("metric_value", 0) > 0)
+                            negative_tests = sum(1 for test in st.session_state.completed_tests 
+                                            if test.get("metric_value", 0) is not None and test.get("metric_value", 0) < 0)
+                            
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.markdown(f"""
+                                <div class="optimization-counter">
+                                    <p class="optimization-counter-text">Total Tests: {total_tests}</p>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                            with col2:
+                                st.markdown(f"""
+                                <div class="optimization-counter" style="background-color: #e8f5e9;">
+                                    <p class="optimization-counter-text">Profitable: {positive_tests}</p>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                            with col3:
+                                st.markdown(f"""
+                                <div class="optimization-counter" style="background-color: #ffebee;">
+                                    <p class="optimization-counter-text">Unprofitable: {negative_tests}</p>
+                                </div>
+                                """, unsafe_allow_html=True)
+                    
+                    # Update the best result display
+                    if 'best_params_display' in st.session_state and st.session_state.best_params_display:
+                        best_params = st.session_state.best_params_display
+                        
+                        # Check if it's a v5 strategy result
+                        if best_params.get('is_v5', False):
+                            # For v5 strategies, include additional parameters
+                            best_result_container.markdown(f"""
+                            <div class="best-result-card">
+                                <h4>🏆 Best Result So Far</h4>
+                                <p><strong>Strategy:</strong> {strategy_type}</p>
+                                <p><strong>Parameters:</strong> Investment {best_params.get('investment_pct')}% | 
+                                Drop {best_params.get('price_drop')}% | Profit {best_params.get('profit_threshold')}% | 
+                                Stop {best_params.get('stop_loss')}% | Trail {best_params.get('trailing_stop')}%
+                                {' | ' + best_params.get('bots_info') if best_params.get('bots_info') else ''}</p>
+                                <p><strong>{best_params.get('metric_name', optimize_metric)}:</strong> 
+                                <span style="color: {'green' if best_params.get('metric_value', 0) > 0 else 'red'}">
+                                {best_params.get('metric_value', 'N/A')}</span></p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        else:
+                            # Standard display for other strategies
+                            best_result_container.markdown(f"""
+                            <div class="best-result-card">
+                                <h4>🏆 Best Result So Far</h4>
+                                <p><strong>Strategy:</strong> {strategy_type}</p>
+                                <p><strong>Parameters:</strong> Investment {best_params.get('investment_pct')}% | 
+                                Drop {best_params.get('price_drop')}% | Profit {best_params.get('profit_threshold')}%</p>
+                                <p><strong>{best_params.get('metric_name', optimize_metric)}:</strong> 
+                                <span style="color: {'green' if best_params.get('metric_value', 0) > 0 else 'red'}">
+                                {best_params.get('metric_value', 'N/A')}</span></p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                    
+                    # We've removed individual test result display to keep the UI cleaner
+                    # Keep track of tests in the background for summary stats only
+                
+                # Run optimization
+                status_text.text(f"Preparing to run optimization with {total_combinations} parameter combinations...")
+                
+                # Use a try-except block to handle potential errors
+                try:
+                    # Run the grid search
+                    optimization_results = optimizer.grid_search(
+                        param_grid=param_grid,
+                        use_multiprocessing=use_multiprocessing,
+                        optimize_metric=optimize_metric,
+                        progress_callback=update_progress
+                    )
+                    
+                    # Update progress
+                    progress_bar.progress(1.0)
+                    progress_percentage.markdown('<p class="progress-text">100%</p>', unsafe_allow_html=True)
+                    status_text.text("Optimization completed successfully!")
+                    
+                    # Store results in session state
+                    st.session_state.optimization_results = optimization_results
+                    st.session_state.optimize_metric = optimize_metric
+                    
+                    # Add best parameters to session state for use in Monte Carlo
+                    if optimization_results:
+                        st.session_state.best_params = optimization_results[0]['params']
+                
+                except Exception as e:
+                    st.error(f"An error occurred during optimization: {str(e)}")
+                    progress_bar.progress(1.0)
+                    progress_percentage.markdown('<p class="progress-text">100%</p>', unsafe_allow_html=True)
+                    status_text.text("Optimization failed.")
+            
+            # Display optimization results if available
+            if st.session_state.optimization_results is not None:
+                optimization_results = st.session_state.optimization_results
+                optimize_metric = st.session_state.optimize_metric
+                
+                # Results tabs
+                tab1, tab2, tab3 = st.tabs(["Optimization Results", "Parameter Analysis", "Detailed View"])
+                
+                # Tab 1: Optimization Results
+                with tab1:
+                    col1, col2 = st.columns([6, 2])
+                    with col1:
+                        st.markdown("### Optimization Results Summary")
+                    with col2:
+                        # Save results button
+                        if st.button("💾 Save Results to Disk", key="save_optimization_results"):
+                            try:
+                                # Import Optimizer
+                                from backtesting.optimizer import ParameterOptimizer
+                                
+                                # Create new optimizer instance
+                                optimizer = ParameterOptimizer()
+                                
+                                # Set the results 
+                                optimizer.results = optimization_results
+                                
+                                # Extract strategy name
+                                strategy_type = st.session_state.get('optimization_strategy_type', 'Unknown Strategy')
+                                
+                                # Create parameter ranges dictionary from session state
+                                parameter_ranges = {}
+                                if st.session_state.get('grid_params') is not None:
+                                    parameter_ranges = st.session_state.grid_params
+                                
+                                # Add additional info
+                                additional_info = {
+                                    'optimize_metric': optimize_metric,
+                                    'data_range': f"{st.session_state.get('start_date', 'Unknown')} to {st.session_state.get('end_date', 'Unknown')}",
+                                    'num_results': len(optimization_results)
+                                }
+                                
+                                # Save the results
+                                filepath = optimizer.save_results(
+                                    strategy_name=strategy_type,
+                                    parameter_ranges=parameter_ranges,
+                                    additional_info=additional_info
+                                )
+                                
+                                if filepath:
+                                    st.success(f"✅ Optimization results saved successfully to disk!")
+                                    st.info(f"You can view saved results in the Results page.")
+                                else:
+                                    st.error("❌ Failed to save results to disk. Check logs for details.")
+                            except Exception as e:
+                                st.error(f"❌ Error saving optimization results: {str(e)}")
+                    
+                    # Get best parameters
+                    best_result = optimization_results[0]
+                    best_params = best_result['params']
+                    
+                    # Display best parameters
+                    st.markdown(f"#### Best Parameters (optimized for {optimize_metric})")
+                    
+                    # Display best parameters based on strategy type
+                    strategy_type = best_params.get('strategy_type', 'Original DCA')
+                    
+                    if strategy_type == "Interval DCA":
+                        best_params_df = pd.DataFrame({
+                            'Parameter': [
+                                'Strategy Type',
+                                'Initial Capital',
+                                'DCA Amount',
+                                'Interval (minutes)',
+                                'Profit Target',
+                                'Trading Fee'
+                            ],
+                            'Value': [
+                                strategy_type,
+                                f"${best_params['initial_capital']:.2f}",
+                                f"${best_params['dca_amount']:.2f}",
+                                f"{best_params['interval_minutes']}",
+                                f"{best_params['profit_target']:.1f}%",
+                                f"{best_params['trading_fee_pct']:.2f}%"
+                            ]
+                        })
+                    elif strategy_type == "Liquidity-Managed DCA":
+                        best_params_df = pd.DataFrame({
+                            'Parameter': [
+                                'Strategy Type',
+                                'Initial Capital',
+                                'Invest Increase',
+                                'Drop Threshold',
+                                'Exit Profit Margin',
+                                'Trading Fee'
+                            ],
+                            'Value': [
+                                strategy_type,
+                                f"${best_params['initial_capital']:.2f}",
+                                f"{best_params['invest_increase']:.1f}%",
+                                f"{best_params['drop_threshold']:.1f}%",
+                                f"{best_params['exit_profit_margin']:.1f}%",
+                                f"{best_params['trading_fee_pct']:.2f}%"
+                            ]
+                        })
+                    else:
+                        best_params_df = pd.DataFrame({
+                            'Parameter': [
+                                'Strategy Type',
+                                'Initial Capital',
+                                'Investment Amount',
+                                'Price Drop Threshold',
+                                'Profit Threshold',
+                                'Trading Fee'
+                            ],
+                            'Value': [
+                                strategy_type,
+                                f"${best_params['initial_capital']:.2f}",
+                                f"{best_params['investment_pct']:.1f}%",
+                                f"{best_params['price_drop_threshold']:.1f}%",
+                                f"{best_params['profit_threshold']:.1f}%",
+                                f"{best_params['trading_fee_pct']:.2f}%"
+                            ]
+                        })
+                    
+                    st.table(best_params_df)
+                    
+                    # Display best result metrics
+                    st.markdown("#### Performance with Best Parameters")
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric(
+                            "Total Return",
+                            f"{best_result['return_pct']:.2f}%",
+                            f"{best_result.get('outperformance', 0):.2f}% vs B&H"
+                        )
+                    
+                    with col2:
+                        st.metric(
+                            "Max Drawdown",
+                            f"{best_result['max_drawdown_pct']:.2f}%"
+                        )
+                    
+                    with col3:
+                        if 'sharpe_ratio' in best_result:
+                            st.metric(
+                                "Sharpe Ratio",
+                                f"{best_result['sharpe_ratio']:.2f}"
+                            )
+                        else:
+                            st.metric(
+                                "Trades Count",
+                                f"{best_result['trades_count']}"
+                            )
+                    
+                    with col4:
+                        if 'win_rate' in best_result:
+                            st.metric(
+                                "Win Rate",
+                                f"{best_result['win_rate']:.1f}%"
+                            )
+                        else:
+                            st.metric(
+                                "Profit Factor",
+                                f"{best_result['full_results'].get('profit_factor', 0):.2f}"
+                            )
+                    
+                    # Heatmap visualization of parameter combinations
+                    st.markdown("#### Parameter Optimization Heatmap")
+                    
+                    # Allow user to select parameters for heatmap
+                    col1, col2, col3 = st.columns(3)
+                    
+                    # Check what strategy type we're dealing with
+                    is_liquidity_strategy = best_params.get('strategy_type') == "Liquidity-Managed DCA"
+                    is_interval_strategy = best_params.get('strategy_type') == "Interval DCA"
+                    
+                    with col1:
+                        if is_liquidity_strategy:
+                            # Liquidity-Managed DCA parameters
+                            x_param = st.selectbox(
+                                "X-axis Parameter",
+                                options=["invest_increase", "drop_threshold", "exit_profit_margin"],
+                                format_func=lambda x: {
+                                    "invest_increase": "Invest Increase Amount ($)",
+                                    "drop_threshold": "Drop Threshold (%)",
+                                    "exit_profit_margin": "Exit Profit Margin (%)"
+                                }.get(x, x),
+                                index=0
+                            )
+                        elif is_interval_strategy:
+                            # Interval DCA parameters
+                            x_param = st.selectbox(
+                                "X-axis Parameter",
+                                options=["dca_amount", "interval_minutes", "profit_target"],
+                                format_func=lambda x: {
+                                    "dca_amount": "DCA Amount ($)",
+                                    "interval_minutes": "Interval (minutes)",
+                                    "profit_target": "Profit Target (%)"
+                                }.get(x, x),
+                                index=0
+                            )
+                        else:
+                            # Standard parameters for other strategies
+                            x_param = st.selectbox(
+                                "X-axis Parameter",
+                                options=["investment_pct", "price_drop_threshold", "profit_threshold"],
+                                format_func=lambda x: {
+                                    "investment_pct": "Investment Amount (%)",
+                                    "price_drop_threshold": "Price Drop Threshold (%)",
+                                    "profit_threshold": "Profit Threshold (%)"
+                                }.get(x, x),
+                                index=0
+                            )
+                    
+                    with col2:
+                        if is_liquidity_strategy:
+                            # Liquidity-Managed DCA parameters
+                            y_param = st.selectbox(
+                                "Y-axis Parameter",
+                                options=["invest_increase", "drop_threshold", "exit_profit_margin"],
+                                format_func=lambda x: {
+                                    "invest_increase": "Invest Increase Amount ($)",
+                                    "drop_threshold": "Drop Threshold (%)",
+                                    "exit_profit_margin": "Exit Profit Margin (%)"
+                                }.get(x, x),
+                                index=1
+                            )
+                        elif is_interval_strategy:
+                            # Interval DCA parameters
+                            y_param = st.selectbox(
+                                "Y-axis Parameter",
+                                options=["dca_amount", "interval_minutes", "profit_target"],
+                                format_func=lambda x: {
+                                    "dca_amount": "DCA Amount ($)",
+                                    "interval_minutes": "Interval (minutes)",
+                                    "profit_target": "Profit Target (%)"
+                                }.get(x, x),
+                                index=1
+                            )
+                        else:
+                            # Standard parameters for other strategies
+                            y_param = st.selectbox(
+                                "Y-axis Parameter",
+                                options=["investment_pct", "price_drop_threshold", "profit_threshold"],
+                                format_func=lambda x: {
+                                    "investment_pct": "Investment Amount (%)",
+                                    "price_drop_threshold": "Price Drop Threshold (%)",
+                                    "profit_threshold": "Profit Threshold (%)"
+                                }.get(x, x),
+                                index=1
+                            )
+                    
+                    with col3:
+                        heatmap_metric = st.selectbox(
+                            "Heatmap Color Metric",
+                            options=["return_pct", "sharpe_ratio", "max_drawdown_pct", "trades_count", "win_rate", "outperformance"],
+                            format_func=lambda x: {
+                                "return_pct": "Total Return",
+                                "sharpe_ratio": "Sharpe Ratio",
+                                "max_drawdown_pct": "Max Drawdown",
+                                "trades_count": "Trades Count",
+                                "win_rate": "Win Rate",
+                                "outperformance": "Outperformance"
+                            }.get(x, x),
+                            index=0
+                        )
+                    
+                    # Check if parameters are the same
+                    if x_param == y_param:
+                        st.warning("Please select different parameters for X and Y axes.")
+                    else:
+                        # Create heatmap
+                        heatmap_fig = PerformancePlots.plot_parameter_heatmap(
+                            optimization_results,
+                            x_param,
+                            y_param,
+                            heatmap_metric
+                        )
+                        
+                        st.plotly_chart(heatmap_fig, use_container_width=True)
+                    
+                    # Display top results table
+                    st.markdown("#### Top 10 Parameter Combinations")
+                    
+                    # Create a dataframe with top results
+                    top_results = optimization_results[:10]
+                    
+                    # Prepare results based on strategy type
+                    table_rows = []
+                    for i, r in enumerate(top_results):
+                        strategy_type = r['params'].get('strategy_type', 'Original DCA')
+                        
+                        if strategy_type == "Liquidity-Managed DCA":
+                            # Format for Liquidity-Managed DCA
+                            row = {
+                                'Rank': i+1,
+                                'Strategy': strategy_type,
+                                'Invest Inc ($)': r['params'].get('invest_increase', 'N/A'),
+                                'Drop Threshold (%)': r['params'].get('drop_threshold', 'N/A'),
+                                'Exit Profit (%)': r['params'].get('exit_profit_margin', 'N/A'),
+                                'Return (%)': r['return_pct'],
+                                'Max Drawdown (%)': r['max_drawdown_pct'],
+                                'Trades': r['trades_count'],
+                                'Sharpe': r.get('sharpe_ratio', 'N/A'),
+                                'Win Rate (%)': r.get('win_rate', 'N/A')
+                            }
+                        elif strategy_type == "Interval DCA":
+                            # Format for Interval DCA
+                            row = {
+                                'Rank': i+1,
+                                'Strategy': strategy_type,
+                                'DCA Amount ($)': r['params'].get('dca_amount', 'N/A'),
+                                'Interval (min)': r['params'].get('interval_minutes', 'N/A'),
+                                'Profit Target (%)': r['params'].get('profit_target', 'N/A'),
+                                'Return (%)': r['return_pct'],
+                                'Max Drawdown (%)': r['max_drawdown_pct'],
+                                'Trades': r['trades_count'],
+                                'Sharpe': r.get('sharpe_ratio', 'N/A'),
+                                'Win Rate (%)': r.get('win_rate', 'N/A')
+                            }
+                        else:
+                            # Format for other strategies
+                            row = {
+                                'Rank': i+1,
+                                'Strategy': strategy_type,
+                                'Investment (%)': r['params'].get('investment_pct', 'N/A'),
+                                'Drop Threshold (%)': r['params'].get('price_drop_threshold', 'N/A'),
+                                'Profit Threshold (%)': r['params'].get('profit_threshold', 'N/A'),
+                                'Return (%)': r['return_pct'],
+                                'Max Drawdown (%)': r['max_drawdown_pct'],
+                                'Trades': r['trades_count'],
+                                'Sharpe': r.get('sharpe_ratio', 'N/A'),
+                                'Win Rate (%)': r.get('win_rate', 'N/A')
+                            }
+                        table_rows.append(row)
+                    
+                    top_df = pd.DataFrame(table_rows)
+                    
+                    st.dataframe(top_df, use_container_width=True)
+                    
+                    # Option to save best parameters for a backtest
+                    st.markdown("### Save Best Parameters")
+                    
+                    if st.button("Use Best Parameters in Backtest"):
+                        # Store best parameters in session state for use in backtest page
+                        st.session_state.best_params = best_params
+                        st.success("Best parameters saved! Go to the Backtest page to use them.")
+                
+                # Tab 2: Parameter Analysis
+                with tab2:
+                    st.markdown("### Parameter Impact Analysis")
+                    
+                    # Allow selection of metric to analyze
+                    analysis_metric = st.selectbox(
+                        "Metric to Analyze",
+                        options=["return_pct", "sharpe_ratio", "max_drawdown_pct", "trades_count", "win_rate", "outperformance"],
+                        format_func=lambda x: {
+                            "return_pct": "Total Return",
+                            "sharpe_ratio": "Sharpe Ratio",
+                            "max_drawdown_pct": "Max Drawdown",
+                            "trades_count": "Trades Count",
+                            "win_rate": "Win Rate",
+                            "outperformance": "Outperformance"
+                        }.get(x, x),
+                        index=0
+                    )
+                    
+                    # Create parameter impact visualizations
+                    st.markdown("#### Investment Amount Impact")
+                    
+                    # Group by investment parameter
+                    inv_values = sorted(set(r['params']['investment_pct'] for r in optimization_results))
+                    inv_results = {}
+                    
+                    for inv in inv_values:
+                        inv_results[inv] = [r[analysis_metric] for r in optimization_results 
+                                           if r['params']['investment_pct'] == inv]
+                    
+                    # Create boxplot figure
+                    fig = go.Figure()
+                    
+                    for inv, values in inv_results.items():
+                        fig.add_trace(go.Box(
+                            y=values,
+                            name=f"{inv}%",
+                            boxpoints='all',
+                            jitter=0.3,
+                            pointpos=-1.8,
+                            marker_color='#1f77b4'
+                        ))
+                    
+                    fig.update_layout(
+                        title=f'Impact of Investment Amount on {analysis_metric}',
+                        xaxis_title='Investment Amount (%)',
+                        yaxis_title=analysis_metric,
+                        template='plotly_white',
+                        margin=dict(l=0, r=0, t=40, b=0)
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Price Drop Threshold Impact
+                    st.markdown("#### Price Drop Threshold Impact")
+                    
+                    # Group by price drop parameter
+                    drop_values = sorted(set(r['params']['price_drop_threshold'] for r in optimization_results))
+                    drop_results = {}
+                    
+                    for drop in drop_values:
+                        drop_results[drop] = [r[analysis_metric] for r in optimization_results 
+                                             if r['params']['price_drop_threshold'] == drop]
+                    
+                    # Create boxplot figure
+                    fig = go.Figure()
+                    
+                    for drop, values in drop_results.items():
+                        fig.add_trace(go.Box(
+                            y=values,
+                            name=f"{drop}%",
+                            boxpoints='all',
+                            jitter=0.3,
+                            pointpos=-1.8,
+                            marker_color='#ff7f0e'
+                        ))
+                    
+                    fig.update_layout(
+                        title=f'Impact of Price Drop Threshold on {analysis_metric}',
+                        xaxis_title='Price Drop Threshold (%)',
+                        yaxis_title=analysis_metric,
+                        template='plotly_white',
+                        margin=dict(l=0, r=0, t=40, b=0)
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Profit Threshold Impact
+                    st.markdown("#### Profit Threshold Impact")
+                    
+                    # Group by profit threshold parameter
+                    profit_values = sorted(set(r['params']['profit_threshold'] for r in optimization_results))
+                    profit_results = {}
+                    
+                    for profit in profit_values:
+                        profit_results[profit] = [r[analysis_metric] for r in optimization_results 
+                                                if r['params']['profit_threshold'] == profit]
+                    
+                    # Create boxplot figure
+                    fig = go.Figure()
+                    
+                    for profit, values in profit_results.items():
+                        fig.add_trace(go.Box(
+                            y=values,
+                            name=f"{profit}%",
+                            boxpoints='all',
+                            jitter=0.3,
+                            pointpos=-1.8,
+                            marker_color='#2ca02c'
+                        ))
+                    
+                    fig.update_layout(
+                        title=f'Impact of Profit Threshold on {analysis_metric}',
+                        xaxis_title='Profit Threshold (%)',
+                        yaxis_title=analysis_metric,
+                        template='plotly_white',
+                        margin=dict(l=0, r=0, t=40, b=0)
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Interactive scatter plot
+                    st.markdown("#### Parameter Correlation Analysis")
+                    
+                    # Select two metrics to plot
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        x_metric = st.selectbox(
+                            "X-axis Metric",
+                            options=["return_pct", "sharpe_ratio", "max_drawdown_pct", "trades_count", "win_rate"],
+                            format_func=lambda x: {
+                                "return_pct": "Total Return",
+                                "sharpe_ratio": "Sharpe Ratio",
+                                "max_drawdown_pct": "Max Drawdown",
+                                "trades_count": "Trades Count",
+                                "win_rate": "Win Rate"
+                            }.get(x, x),
+                            index=0
+                        )
+                    
+                    with col2:
+                        y_metric = st.selectbox(
+                            "Y-axis Metric",
+                            options=["return_pct", "sharpe_ratio", "max_drawdown_pct", "trades_count", "win_rate"],
+                            format_func=lambda x: {
+                                "return_pct": "Total Return",
+                                "sharpe_ratio": "Sharpe Ratio",
+                                "max_drawdown_pct": "Max Drawdown",
+                                "trades_count": "Trades Count",
+                                "win_rate": "Win Rate"
+                            }.get(x, x),
+                            index=1
+                        )
+                    
+                    # Color by parameter based on strategy type
+                    if is_interval_strategy:
+                        color_param = st.selectbox(
+                            "Color by Parameter",
+                            options=["dca_amount", "interval_minutes", "profit_target"],
+                            format_func=lambda x: {
+                                "dca_amount": "DCA Amount ($)",
+                                "interval_minutes": "Interval (minutes)",
+                                "profit_target": "Profit Target (%)"
+                            }.get(x, x),
+                            index=0
+                        )
+                    elif is_liquidity_strategy:
+                        color_param = st.selectbox(
+                            "Color by Parameter",
+                            options=["invest_increase", "drop_threshold", "exit_profit_margin"],
+                            format_func=lambda x: {
+                                "invest_increase": "Invest Increase Amount (%)",
+                                "drop_threshold": "Drop Threshold (%)",
+                                "exit_profit_margin": "Exit Profit Margin (%)"
+                            }.get(x, x),
+                            index=0
+                        )
+                    else:
+                        color_param = st.selectbox(
+                            "Color by Parameter",
+                            options=["investment_pct", "price_drop_threshold", "profit_threshold"],
+                            format_func=lambda x: {
+                                "investment_pct": "Investment Amount (%)",
+                                "price_drop_threshold": "Price Drop Threshold (%)",
+                                "profit_threshold": "Profit Threshold (%)"
+                            }.get(x, x),
+                            index=0
+                        )
+                    
+                    # Create scatter plot
+                    x_values = [r[x_metric] for r in optimization_results]
+                    y_values = [r[y_metric] for r in optimization_results]
+                    color_values = [r['params'][color_param] for r in optimization_results]
+                    
+                    # Create hover text with parameter info based on strategy type
+                    hover_texts = []
+                    for r in optimization_results:
+                        strategy_type = r['params'].get('strategy_type', 'Original DCA')
+                        
+                        if strategy_type == "Interval DCA":
+                            hover_text = (
+                                f"Strategy: {strategy_type}<br>"
+                                f"DCA Amount: ${r['params']['dca_amount']}<br>"
+                                f"Interval: {r['params']['interval_minutes']} min<br>"
+                                f"Profit Target: {r['params']['profit_target']}%<br>"
+                                f"Return: {r['return_pct']:.2f}%<br>"
+                                f"Sharpe: {r.get('sharpe_ratio', 'N/A')}<br>"
+                                f"Trades: {r['trades_count']}<br>"
+                                f"Win Rate: {r.get('win_rate', 'N/A')}%"
+                            )
+                        elif strategy_type == "Liquidity-Managed DCA":
+                            hover_text = (
+                                f"Strategy: {strategy_type}<br>"
+                                f"Invest Increase: {r['params']['invest_increase']}%<br>"
+                                f"Drop Threshold: {r['params']['drop_threshold']}%<br>"
+                                f"Exit Profit Margin: {r['params']['exit_profit_margin']}%<br>"
+                                f"Return: {r['return_pct']:.2f}%<br>"
+                                f"Sharpe: {r.get('sharpe_ratio', 'N/A')}<br>"
+                                f"Trades: {r['trades_count']}<br>"
+                                f"Win Rate: {r.get('win_rate', 'N/A')}%"
+                            )
+                        else:
+                            hover_text = (
+                                f"Strategy: {strategy_type}<br>"
+                                f"Investment: {r['params']['investment_pct']}%<br>"
+                                f"Drop Threshold: {r['params']['price_drop_threshold']}%<br>"
+                                f"Profit Threshold: {r['params']['profit_threshold']}%<br>"
+                                f"Return: {r['return_pct']:.2f}%<br>"
+                                f"Sharpe: {r.get('sharpe_ratio', 'N/A')}<br>"
+                                f"Trades: {r['trades_count']}<br>"
+                                f"Win Rate: {r.get('win_rate', 'N/A')}%"
+                            )
+                        hover_texts.append(hover_text)
+                    
+                    fig = go.Figure()
+                    
+                    fig.add_trace(go.Scatter(
+                        x=x_values,
+                        y=y_values,
+                        mode='markers',
+                        marker=dict(
+                            size=10,
+                            color=color_values,
+                            colorscale='Viridis',
+                            colorbar=dict(title=color_param),
+                            showscale=True
+                        ),
+                        text=hover_texts,
+                        hovertemplate='%{text}<extra></extra>'
+                    ))
+                    
+                    fig.update_layout(
+                        title=f'Correlation between {x_metric} and {y_metric}',
+                        xaxis_title=x_metric,
+                        yaxis_title=y_metric,
+                        template='plotly_white',
+                        margin=dict(l=0, r=0, t=40, b=0)
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Tab 3: Detailed View
+                with tab3:
+                    st.markdown("### Detailed Results View")
+                    
+                    # Allow filtering of results
+                    st.markdown("#### Filter Results")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        min_return = st.number_input(
+                            "Min Return (%)",
+                            min_value=float(min(r['return_pct'] for r in optimization_results)),
+                            max_value=float(max(r['return_pct'] for r in optimization_results)),
+                            value=float(min(r['return_pct'] for r in optimization_results)),
+                            step=1.0
+                        )
+                    
+                    with col2:
+                        max_drawdown = st.number_input(
+                            "Max Drawdown (%)",
+                            min_value=float(min(r['max_drawdown_pct'] for r in optimization_results)),
+                            max_value=float(max(r['max_drawdown_pct'] for r in optimization_results)),
+                            value=float(max(r['max_drawdown_pct'] for r in optimization_results)),
+                            step=1.0
+                        )
+                    
+                    with col3:
+                        min_trades = st.number_input(
+                            "Min Trades",
+                            min_value=int(min(r['trades_count'] for r in optimization_results)),
+                            max_value=int(max(r['trades_count'] for r in optimization_results)),
+                            value=int(min(r['trades_count'] for r in optimization_results)),
+                            step=1
+                        )
+                    
+                    # Filter results
+                    filtered_results = [
+                        r for r in optimization_results
+                        if r['return_pct'] >= min_return and 
+                        r['max_drawdown_pct'] >= max_drawdown and
+                        r['trades_count'] >= min_trades
+                    ]
+                    
+                    # Display filtered results
+                    st.markdown(f"#### Filtered Results ({len(filtered_results)} combinations)")
+                    
+                    # Create a dataframe with all results
+                    result_rows = []
+                    for r in filtered_results:
+                        strategy_type = r['params'].get('strategy_type', 'Original DCA')
+                        
+                        if strategy_type == "Liquidity-Managed DCA":
+                            # Format for Liquidity-Managed DCA
+                            row = {
+                                'Strategy': strategy_type,
+                                'Invest Inc ($)': r['params'].get('invest_increase', 'N/A'),
+                                'Drop Threshold (%)': r['params'].get('drop_threshold', 'N/A'),
+                                'Exit Profit (%)': r['params'].get('exit_profit_margin', 'N/A'),
+                                'Return (%)': r['return_pct'],
+                                'Max Drawdown (%)': r['max_drawdown_pct'],
+                                'Trades': r['trades_count'],
+                                'Sharpe': r.get('sharpe_ratio', 'N/A'),
+                                'Win Rate (%)': r.get('win_rate', 'N/A'),
+                                'Outperformance (%)': r.get('outperformance', 'N/A')
+                            }
+                        elif strategy_type == "Interval DCA":
+                            # Format for Interval DCA
+                            row = {
+                                'Strategy': strategy_type,
+                                'DCA Amount ($)': r['params'].get('dca_amount', 'N/A'),
+                                'Interval (min)': r['params'].get('interval_minutes', 'N/A'),
+                                'Profit Target (%)': r['params'].get('profit_target', 'N/A'),
+                                'Return (%)': r['return_pct'],
+                                'Max Drawdown (%)': r['max_drawdown_pct'],
+                                'Trades': r['trades_count'],
+                                'Sharpe': r.get('sharpe_ratio', 'N/A'),
+                                'Win Rate (%)': r.get('win_rate', 'N/A'),
+                                'Outperformance (%)': r.get('outperformance', 'N/A')
+                            }
+                        else:
+                            # Format for other strategies
+                            row = {
+                                'Strategy': strategy_type,
+                                'Investment (%)': r['params'].get('investment_pct', 'N/A'),
+                                'Drop Threshold (%)': r['params'].get('price_drop_threshold', 'N/A'),
+                                'Profit Threshold (%)': r['params'].get('profit_threshold', 'N/A'),
+                                'Return (%)': r['return_pct'],
+                                'Max Drawdown (%)': r['max_drawdown_pct'],
+                                'Trades': r['trades_count'],
+                                'Sharpe': r.get('sharpe_ratio', 'N/A'),
+                                'Win Rate (%)': r.get('win_rate', 'N/A'),
+                                'Outperformance (%)': r.get('outperformance', 'N/A')
+                            }
+                        result_rows.append(row)
+                    
+                    all_results_df = pd.DataFrame(result_rows)
+                    
+                    # Add sort options
+                    sort_col = st.selectbox(
+                        "Sort by",
+                        options=all_results_df.columns.tolist(),
+                        index=3  # Default to Return (%)
+                    )
+                    
+                    sort_ascending = st.checkbox("Sort Ascending", value=False)
+                    
+                    # Sort the dataframe
+                    sorted_df = all_results_df.sort_values(by=sort_col, ascending=sort_ascending)
+                    
+                    # Display the dataframe
+                    st.dataframe(sorted_df, use_container_width=True)
+                    
+                    # Optimization summary
+                    st.markdown("#### Optimization Summary")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.metric(
+                            "Total Combinations",
+                            f"{len(optimization_results)}"
+                        )
+                    
+                    with col2:
+                        st.metric(
+                            "Return Range",
+                            f"{min(r['return_pct'] for r in optimization_results):.1f}% to {max(r['return_pct'] for r in optimization_results):.1f}%"
+                        )
+                    
+                    with col3:
+                        st.metric(
+                            "Drawdown Range",
+                            f"{min(r['max_drawdown_pct'] for r in optimization_results):.1f}% to {max(r['max_drawdown_pct'] for r in optimization_results):.1f}%"
+                        )
+                    
+                    # Option to download full results
+                    csv_data = all_results_df.to_csv(index=False)
+                    st.download_button(
+                        label="Download Results as CSV",
+                        data=csv_data,
+                        file_name="optimization_results.csv",
+                        mime="text/csv"
+                    )
+    
+    except Exception as e:
+        st.error(f"An error occurred while processing the data: {str(e)}")
